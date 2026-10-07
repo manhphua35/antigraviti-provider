@@ -7,8 +7,8 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import path from "node:path";
-import { isQuotaError, markQuotaExhausted, rotateToNextAvailableAccount } from "./accounts.js";
-import { apiKeysMatch, recordKeyUsage, validateApiKey } from "./api-key.js";
+import { withQuotaRotation } from "./accounts.js";
+import { recordKeyUsage, validateApiKey } from "./api-key.js";
 import {
 	ChatRequestError,
 	DEFAULT_SERVER_EFFORT,
@@ -23,7 +23,7 @@ import {
 import { AntigravityApiError } from "./errors.js";
 import { generateAntigravity } from "./generate.js";
 import { catalogAntigravityModel } from "./models.js";
-import { saveSession, sessionPathFor } from "./session.js";
+import { sessionPathFor, sessionScopeForKey } from "./session.js";
 
 const BODY_LIMIT = 8 * 1024 * 1024;
 
@@ -100,19 +100,28 @@ function errorStatus(error) {
  */
 export function createChatServer(options) {
 	const generate = options.generate ?? generateAntigravity;
-	let callChain = Promise.resolve();
-	const enqueueCall = (task) => {
-		const run = callChain.then(task, task);
-		callChain = run.then(
+	/** @type {Map<string, Promise<void>>} */
+	const callChains = new Map();
+	// One in-flight call per client key. Different keys do not share a trajectory, so they can run together.
+	const enqueueCall = (key, task) => {
+		const prev = callChains.get(key) ?? Promise.resolve();
+		const run = prev.then(task, task);
+		const settled = run.then(
 			() => undefined,
 			() => undefined,
 		);
+		callChains.set(key, settled);
+		settled.then(() => {
+			if (callChains.get(key) === settled) callChains.delete(key);
+		});
 		return run;
 	};
 	return http.createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", "http://127.0.0.1");
 		const baseDir = options.credentialPath ? path.dirname(options.credentialPath) : undefined;
 		const apiKeysPath = options.apiKeysPath ?? (baseDir ? path.join(baseDir, "api-keys.json") : undefined);
+		const accountsDir = options.accountsDir ?? (baseDir ? path.join(baseDir, "accounts") : undefined);
+		const accountsIndexPath = options.accountsIndexPath ?? (baseDir ? path.join(baseDir, "accounts.json") : undefined);
 		try {
 			if (req.method === "GET") {
 				if (url.pathname === "/" || url.pathname === "/health") {
@@ -188,14 +197,20 @@ export function createChatServer(options) {
 				}
 				res.write(`data: ${JSON.stringify(chunk)}\n\n`);
 			};
-			let currentCredential = credential;
 			const autoRotate = options.autoRotate !== false;
-			const triedAccounts = new Set();
-			if (currentCredential?.email) triedAccounts.add(currentCredential.email.toLowerCase());
-			let result;
-			while (true) {
-				try {
-					result = await enqueueCall(() =>
+			const sessionScope = sessionScopeForKey(keyAuth.key || presented || "anonymous");
+			const sessionPath = options.credentialPath ? sessionPathFor(options.credentialPath, sessionScope) : undefined;
+			const result = await enqueueCall(sessionScope, () =>
+				withQuotaRotation({
+					credential,
+					autoRotate,
+					credentialPath: options.credentialPath,
+					accountsDir,
+					indexPath: accountsIndexPath,
+					sessionPath,
+					canRotate: () => !started,
+					onRotate: options.onRotate,
+					run: (currentCredential) =>
 						generate({
 							credential: currentCredential,
 							credentialPath: options.credentialPath,
@@ -214,49 +229,17 @@ export function createChatServer(options) {
 							topP: chat.topP,
 							topK: chat.topK,
 							presencePenalty: chat.presencePenalty,
-							sessionPath: options.credentialPath ? sessionPathFor(options.credentialPath) : undefined,
+							sessionPath,
 							signal: abort.signal,
+							retryRateLimit: !autoRotate,
 							onText(delta) {
 								if (!chat.stream || !delta) return;
 								streamId ??= `chatcmpl-${crypto.randomUUID()}`;
 								writeChunk(formatChatChunk(streamId, { content: delta }, null));
 							},
 						}),
-					);
-					break;
-				} catch (error) {
-					if (autoRotate && isQuotaError(error) && !started) {
-						const currentEmail = currentCredential?.email;
-						const baseDir = options.credentialPath ? path.dirname(options.credentialPath) : undefined;
-						const accountsDir = options.accountsDir ?? (baseDir ? path.join(baseDir, "accounts") : undefined);
-						const indexPath = options.accountsIndexPath ?? (baseDir ? path.join(baseDir, "accounts.json") : undefined);
-
-						if (currentEmail) {
-							markQuotaExhausted(currentEmail, { accountsDir, indexPath });
-						}
-						const rotation = rotateToNextAvailableAccount(currentEmail, {
-							accountsDir,
-							indexPath,
-							credentialPath: options.credentialPath,
-						});
-						if (rotation.rotated && rotation.credential && rotation.newEmail && !triedAccounts.has(rotation.newEmail.toLowerCase())) {
-							triedAccounts.add(rotation.newEmail.toLowerCase());
-							options.onRotate?.({ from: currentEmail, to: rotation.newEmail });
-							currentCredential = rotation.credential;
-							if (options.credentialPath) {
-								try {
-									const sPath = sessionPathFor(options.credentialPath);
-									saveSession({}, sPath);
-								} catch {
-									// Best effort
-								}
-							}
-							continue;
-						}
-					}
-					throw error;
-				}
-			}
+				}),
+			);
 			if (chat.stream) {
 				streamId ??= `chatcmpl-${result.responseId ?? crypto.randomUUID()}`;
 				const calls = result.toolCalls ?? [];

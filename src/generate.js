@@ -380,17 +380,47 @@ async function consumeStream(response, model, toolNames, signal, firstEventTimeo
  * @param {RequestInit} init
  * @param {{ attempts: number, sleep: (ms: number, signal?: AbortSignal) => Promise<void>, signal?: AbortSignal, maxDelayMs: number }} retry
  */
+/**
+ * Drop a response we are not going to read so the connection can be reused.
+ * @param {Response} response
+ */
+async function cancelBody(response) {
+	try {
+		await response.body?.cancel();
+	} catch {
+		// The body is unused on a retry.
+	}
+}
+
+/**
+ * @param {typeof fetch} fetcher
+ * @param {string} url
+ * @param {RequestInit} init
+ * @param {{
+ *   attempts: number,
+ *   sleep: (ms: number, signal?: AbortSignal) => Promise<void>,
+ *   signal?: AbortSignal,
+ *   timeoutMs: number,
+ *   retryRateLimit?: boolean,
+ *   maxDelayMs: number,
+ * }} retry
+ */
 async function fetchWithRetry(fetcher, url, init, retry) {
 	let lastError;
 	for (let attempt = 0; attempt < retry.attempts; attempt += 1) {
 		if (retry.signal?.aborted) throw Object.assign(new Error("Request was aborted"), { name: "AbortError" });
+		// A new signal per attempt. Reusing one aborted controller made every retry fail immediately.
+		const watchdog = armPreResponseTimeout(retry.signal, retry.timeoutMs);
 		try {
-			const response = await fetcher(url, init);
-			if (response.ok || !isTransientStatus(response.status) || attempt === retry.attempts - 1) return response;
+			const response = await fetcher(url, { ...init, signal: watchdog.signal });
+			const rateLimited = response.status === 429 && retry.retryRateLimit === false;
+			const retryable = !response.ok && !rateLimited && isTransientStatus(response.status) && attempt < retry.attempts - 1;
+			if (!retryable) return response;
 			lastError = apiError(`Cloud Code Assist API error (${response.status})`, response.status, "http");
+			await cancelBody(response);
 		} catch (error) {
 			if (retry.signal?.aborted) throw error;
-			const timedOut = error instanceof Error && error.name === "AbortError";
+			const timedOut = watchdog.signal.aborted && error instanceof Error && error.name === "AbortError";
 			if (timedOut) {
 				lastError = apiError(FIRST_EVENT_TIMEOUT_ERROR, undefined, "timeout");
 				if (attempt === retry.attempts - 1) throw lastError;
@@ -399,6 +429,8 @@ async function fetchWithRetry(fetcher, url, init, retry) {
 			} else {
 				lastError = error;
 			}
+		} finally {
+			watchdog.clear();
 		}
 		const backoff = Math.min(BASE_DELAY_MS * 2 ** attempt, retry.maxDelayMs);
 		await retry.sleep(backoff, retry.signal);
@@ -464,6 +496,7 @@ export async function listAntigravityModels(options) {
  *   save?: boolean,
  *   firstEventTimeoutMs?: number,
  *   maxRetryDelayMs?: number,
+ *   retryRateLimit?: boolean,
  *   acceptEmptyResponse?: boolean,
  *   onText?: (delta: string) => void,
  *   onThinking?: (delta: string) => void,
@@ -537,18 +570,14 @@ export async function generateAntigravity(options) {
 		started = false;
 		try {
 			const url = `${endpoint}${STREAM_PATH}`;
-			const watchdog = armPreResponseTimeout(options.signal, firstEventTimeoutMs);
-			let response;
-			try {
-				response = await fetchWithRetry(fetcher, url, { method: "POST", headers, body, signal: watchdog.signal }, {
-					attempts: isLast ? MAX_RETRIES + 1 : 1,
-					sleep,
-					signal: options.signal,
-					maxDelayMs: options.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
-				});
-			} finally {
-				watchdog.clear();
-			}
+			const response = await fetchWithRetry(fetcher, url, { method: "POST", headers, body }, {
+				attempts: isLast ? MAX_RETRIES + 1 : 1,
+				sleep,
+				signal: options.signal,
+				timeoutMs: firstEventTimeoutMs,
+				retryRateLimit: options.retryRateLimit !== false,
+				maxDelayMs: options.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
+			});
 			if (!response.ok) {
 				const errorText = await response.text();
 				if (isTransientStatus(response.status) && !isLast) continue;

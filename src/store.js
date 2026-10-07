@@ -13,13 +13,15 @@ export function defaultCredentialPath() {
 }
 
 /**
- * @param {object} credential
- * @param {string} [file]
+ * Atomic JSON write with mode 0600. Callers share this so credential, account,
+ * session, and API-key files cannot tear on a crash.
+ * @param {string} file
+ * @param {object} data
  */
-export function saveCredentials(credential, file = defaultCredentialPath()) {
+export function writeJsonAtomic(file, data) {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	const json = `${JSON.stringify(credential, null, 2)}\n`;
-	const tmp = `${file}.${process.pid}.tmp`;
+	const json = `${JSON.stringify(data, null, 2)}\n`;
+	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
 	fs.writeFileSync(tmp, json, { encoding: "utf8", mode: 0o600 });
 	fs.renameSync(tmp, file);
 	try {
@@ -28,6 +30,14 @@ export function saveCredentials(credential, file = defaultCredentialPath()) {
 		// chmod is not meaningful on every Windows filesystem. The file is still written.
 	}
 	return file;
+}
+
+/**
+ * @param {object} credential
+ * @param {string} [file]
+ */
+export function saveCredentials(credential, file = defaultCredentialPath()) {
+	return writeJsonAtomic(file, credential);
 }
 
 /**
@@ -40,18 +50,4 @@ export function loadCredentials(file = defaultCredentialPath()) {
 		throw new Error(`Credential file is missing a refresh token: ${file}`);
 	}
 	return parsed;
-}
-
-/**
- * JSON api key shape the Antigravity client expects: token plus project id.
- * @param {{ access: string, refresh?: string, expires?: number, email?: string, projectId?: string }} credential
- */
-export function toStructuredApiKey(credential) {
-	return JSON.stringify({
-		token: credential.access,
-		projectId: credential.projectId,
-		refreshToken: credential.refresh,
-		expiresAt: credential.expires,
-		email: credential.email,
-	});
 }

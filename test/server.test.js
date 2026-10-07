@@ -4,7 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
-import { resolveServerApiKey } from "../src/api-key.js";
+import { createApiKey, resolveServerApiKey } from "../src/api-key.js";
 import { normalizeChatRequest, SERVER_MODEL_ID } from "../src/chat.js";
 import { createChatServer, listen } from "../src/server.js";
 
@@ -16,6 +16,7 @@ async function withServer(generate, options, run) {
 	const server = createChatServer({
 		apiKey: options?.apiKey ?? "test-key",
 		credentialPath: options?.credentialPath ?? path.join(os.tmpdir(), "antigravity-provider-test-credentials.json"),
+		apiKeysPath: options?.apiKeysPath,
 		loadCredential: options?.loadCredential ?? (() => ({ access: "token", refresh: "refresh", projectId: "project-1" })),
 		generate,
 	});
@@ -247,7 +248,7 @@ describe("chat server", () => {
 		assert.equal(forwarded.save, undefined);
 		assert.equal(forwarded.models[0].id, "gemini-3.8-flash");
 		assert.equal(forwarded.models[0].thinking.effortRouting.medium, "gemini-3.8-flash-medium");
-		assert.match(forwarded.sessionPath, /session\.json$/);
+		assert.match(forwarded.sessionPath, /sessions[\\/][a-f0-9]{32}\.json$/);
 		assert.equal(forwarded.apiKey, undefined);
 		assert.equal(forwarded.tools[0].name, "lookup");
 		assert.equal(forwarded.temperature, 0.2);
@@ -257,6 +258,49 @@ describe("chat server", () => {
 		assert.equal(forwarded.messages[0].content[1].data, "aaaa");
 		assert.equal(forwarded.messages[1].content[0].type, "toolCall");
 		assert.deepEqual(forwarded.messages[1].content[0].arguments, { q: "x" });
+	});
+
+	it("rejects a remote image URL before calling the model", async () => {
+		const response = await withServer(
+			async () => {
+				throw new Error("generate should not run");
+			},
+			{},
+			(port) =>
+				post(port, {
+					messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: "https://example.com/a.jpg" } }] }],
+				}),
+		);
+		assert.equal(response.status, 400);
+		assert.match(response.body, /data URLs/);
+	});
+
+	it("gives each API key its own session file", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-session-test-"));
+		const storePath = path.join(dir, "api-keys.json");
+		createApiKey({ name: "A", key: "key-a" }, { storePath });
+		createApiKey({ name: "B", key: "key-b" }, { storePath });
+		/** @type {string[]} */
+		const sessions = [];
+		try {
+			await withServer(
+				async (options) => {
+					sessions.push(options.sessionPath);
+					return result(options);
+				},
+				{ apiKeysPath: storePath, credentialPath: path.join(dir, "credentials.json") },
+				async (port) => {
+					const first = await post(port, { prompt: "Hi" }, { auth: "key-a" });
+					const second = await post(port, { prompt: "Hi" }, { auth: "key-b" });
+					assert.equal(first.status, 200);
+					assert.equal(second.status, 200);
+				},
+			);
+			assert.equal(sessions.length, 2);
+			assert.notEqual(sessions[0], sessions[1]);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("streams text and tool calls", async () => {

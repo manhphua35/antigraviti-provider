@@ -140,6 +140,27 @@ describe("multi-account management", () => {
 		}
 	});
 
+	it("treats email case as the same account", () => {
+		const env = setupTestEnv();
+		try {
+			const first = upsertAccount(
+				{ email: "User@gmail.com", projectId: "p", access: "t1", refresh: "r", expires: Date.now() + 1000 },
+				env,
+			);
+			const second = upsertAccount(
+				{ email: "user@gmail.com", projectId: "p", access: "t2", refresh: "r", expires: Date.now() + 1000 },
+				env,
+			);
+			assert.equal(first.email, "user@gmail.com");
+			assert.equal(second.isNewAccount, false);
+			assert.equal(listAccounts(env).length, 1);
+			assert.equal(loadCredentials(env.credentialPath).access, "t2");
+			assert.equal(loadCredentials(first.file).access, "t2");
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+
 	it("removes account and deletes its file", () => {
 		const env = setupTestEnv();
 		try {
@@ -193,6 +214,12 @@ describe("auto-quota rotation", () => {
 			assert.equal(rot2.rotated, true);
 			assert.equal(rot2.newEmail, "c@gmail.com");
 			assert.equal(loadCredentials(env.credentialPath).email, "c@gmail.com");
+
+			markQuotaExhausted("b@gmail.com", env);
+			switchActiveAccount("a@gmail.com", env);
+			const skipped = rotateToNextAvailableAccount("a@gmail.com", env);
+			assert.equal(skipped.rotated, true);
+			assert.equal(skipped.newEmail, "c@gmail.com");
 
 			// Reset quota works
 			resetAccountQuota("a@gmail.com", env);

@@ -8,7 +8,18 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { defaultCredentialPath, loadCredentials, saveCredentials } from "./store.js";
+import { saveSession } from "./session.js";
+import { defaultCredentialPath, loadCredentials, saveCredentials, writeJsonAtomic } from "./store.js";
+
+/**
+ * Gmail addresses are case-insensitive. Index keys and filenames use this form.
+ * @param {unknown} email
+ * @returns {string | null}
+ */
+export function canonicalAccountEmail(email) {
+	const value = String(email ?? "").trim().toLowerCase();
+	return value || null;
+}
 
 /** Default directory for individual account credential files */
 export function defaultAccountsDir() {
@@ -25,7 +36,7 @@ export function defaultAccountsIndexPath() {
  * @param {string} email
  */
 export function accountFileName(email) {
-	const safe = String(email).trim().toLowerCase().replace(/[/\\?%*:|"<>]/g, "_");
+	const safe = (canonicalAccountEmail(email) ?? "account").replace(/[/\\?%*:|"<>]/g, "_");
 	return `${safe}.json`;
 }
 
@@ -39,21 +50,39 @@ export function accountFilePath(email, accountsDir = defaultAccountsDir()) {
 }
 
 /**
- * Atomic JSON file write with 0600 permissions.
- * @param {string} file
- * @param {object} data
+ * Fold mixed-case copies of one mailbox into a single index entry.
+ * @param {Record<string, any>} accounts
  */
-function writeJsonAtomic(file, data) {
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	const json = `${JSON.stringify(data, null, 2)}\n`;
-	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-	fs.writeFileSync(tmp, json, { encoding: "utf8", mode: 0o600 });
-	fs.renameSync(tmp, file);
-	try {
-		fs.chmodSync(file, 0o600);
-	} catch {
-		// chmod may not apply on all Windows filesystems
+function collapseAccountKeys(accounts) {
+	/** @type {Record<string, any>} */
+	const collapsed = {};
+	let changed = false;
+	for (const [email, record] of Object.entries(accounts)) {
+		const key = canonicalAccountEmail(record?.email || email);
+		if (!key) {
+			changed = true;
+			continue;
+		}
+		if (key !== email || record?.email !== key || collapsed[key]) changed = true;
+		const existing = collapsed[key];
+		if (!existing) {
+			collapsed[key] = { ...record, email: key };
+			continue;
+		}
+		const preferNext = (record.updatedAt ?? 0) >= (existing.updatedAt ?? 0);
+		const primary = preferNext ? record : existing;
+		const secondary = preferNext ? existing : record;
+		const exhausted = [primary, secondary]
+			.filter((item) => item.quotaStatus === "exhausted")
+			.sort((a, b) => (b.lastQuotaExhausted ?? 0) - (a.lastQuotaExhausted ?? 0))[0];
+		collapsed[key] = {
+			...primary,
+			email: key,
+			quotaStatus: exhausted ? "exhausted" : (primary.quotaStatus ?? "ok"),
+			lastQuotaExhausted: exhausted?.lastQuotaExhausted ?? null,
+		};
 	}
+	return { accounts: changed ? collapsed : accounts, changed };
 }
 
 /**
@@ -89,6 +118,18 @@ export function loadAccountsIndex(options = {}) {
 	}
 
 	let modified = false;
+	const collapsed = collapseAccountKeys(index.accounts);
+	if (collapsed.changed) {
+		index.accounts = collapsed.accounts;
+		modified = true;
+	}
+	if (index.active) {
+		const active = canonicalAccountEmail(index.active);
+		if (active !== index.active) {
+			index.active = active;
+			modified = true;
+		}
+	}
 
 	// Scan accounts directory for any standalone account files not yet in index
 	if (fs.existsSync(accountsDir)) {
@@ -99,9 +140,10 @@ export function loadAccountsIndex(options = {}) {
 				const fullPath = path.join(accountsDir, file);
 				try {
 					const cred = JSON.parse(fs.readFileSync(fullPath, "utf8"));
-					if (cred?.email && !index.accounts[cred.email]) {
-						index.accounts[cred.email] = {
-							email: cred.email,
+					const email = canonicalAccountEmail(cred?.email);
+					if (email && !index.accounts[email]) {
+						index.accounts[email] = {
+							email,
 							projectId: cred.projectId,
 							file: fullPath,
 							expires: cred.expires,
@@ -124,14 +166,15 @@ export function loadAccountsIndex(options = {}) {
 	if (fs.existsSync(credentialPath)) {
 		try {
 			const cred = loadCredentials(credentialPath);
-			if (cred?.email) {
-				const accFile = accountFilePath(cred.email, accountsDir);
+			const email = canonicalAccountEmail(cred?.email);
+			if (email) {
+				const accFile = accountFilePath(email, accountsDir);
 				if (!fs.existsSync(accFile)) {
-					saveCredentials(cred, accFile);
+					saveCredentials({ ...cred, email }, accFile);
 				}
-				if (!index.accounts[cred.email]) {
-					index.accounts[cred.email] = {
-						email: cred.email,
+				if (!index.accounts[email]) {
+					index.accounts[email] = {
+						email,
 						projectId: cred.projectId,
 						file: accFile,
 						expires: cred.expires,
@@ -142,7 +185,7 @@ export function loadAccountsIndex(options = {}) {
 					modified = true;
 				}
 				if (!index.active) {
-					index.active = cred.email;
+					index.active = email;
 					modified = true;
 				}
 			}
@@ -198,10 +241,11 @@ export function saveAccountsIndex(index, indexPath = defaultAccountsIndexPath())
  * }}
  */
 export function upsertAccount(credential, options = {}) {
-	const email = credential.email;
+	const email = canonicalAccountEmail(credential.email);
 	if (!email) {
 		throw new Error("Cannot store account without an email address");
 	}
+	const storedCredential = { ...credential, email };
 
 	const accountsDir = options.accountsDir ?? defaultAccountsDir();
 	const indexPath = options.indexPath ?? defaultAccountsIndexPath();
@@ -214,14 +258,14 @@ export function upsertAccount(credential, options = {}) {
 
 	// Save individual account file
 	const targetFile = accountFilePath(email, accountsDir);
-	saveCredentials(credential, targetFile);
+	saveCredentials(storedCredential, targetFile);
 
 	// Update record in index
 	index.accounts[email] = {
 		email,
-		projectId: credential.projectId,
+		projectId: storedCredential.projectId,
 		file: targetFile,
-		expires: credential.expires,
+		expires: storedCredential.expires,
 		quotaStatus: index.accounts[email]?.quotaStatus ?? "ok",
 		lastQuotaExhausted: index.accounts[email]?.lastQuotaExhausted ?? null,
 		updatedAt: Date.now(),
@@ -229,7 +273,7 @@ export function upsertAccount(credential, options = {}) {
 
 	if (setActive) {
 		index.active = email;
-		saveCredentials(credential, credentialPath);
+		saveCredentials(storedCredential, credentialPath);
 	}
 
 	saveAccountsIndex(index, indexPath);
@@ -415,11 +459,14 @@ export function isQuotaError(error) {
  */
 export function markQuotaExhausted(email, options = {}) {
 	const index = loadAccountsIndex(options);
-	const targetEmail = Object.keys(index.accounts).find((k) => k.toLowerCase() === email.toLowerCase());
+	const targetEmail = Object.keys(index.accounts).find((k) => k.toLowerCase() === String(email).toLowerCase());
 	if (!targetEmail || !index.accounts[targetEmail]) return;
+	const account = index.accounts[targetEmail];
+	// A later failure inside the same cooldown must not push recovery further out.
+	if (isAccountQuotaExhausted(account)) return;
 
-	index.accounts[targetEmail].quotaStatus = "exhausted";
-	index.accounts[targetEmail].lastQuotaExhausted = Date.now();
+	account.quotaStatus = "exhausted";
+	account.lastQuotaExhausted = Date.now();
 	saveAccountsIndex(index, options.indexPath ?? defaultAccountsIndexPath());
 }
 
@@ -454,8 +501,8 @@ export function resetAccountQuota(email, options = {}) {
 }
 
 /**
- * Rotate to the next available account when the current one hits its quota limit.
- * Prefers accounts with quotaStatus === "ok", or the one with the oldest lastQuotaExhausted.
+ * Rotate to the next account that is outside its quota cooldown.
+ * Returns rotated: false when every other account is still exhausted.
  * @param {string | undefined | null} currentEmail
  * @param {{
  *   indexPath?: string,
@@ -484,18 +531,7 @@ export function rotateToNextAvailableAccount(currentEmail, options = {}) {
 	}
 
 	const now = options.now ?? Date.now();
-	// 1. Look for candidate that is NOT exhausted (or whose cooldown has elapsed)
-	let next = candidates.find((a) => !isAccountQuotaExhausted(a, now));
-
-	// 2. If all candidates are marked exhausted, pick the one with oldest lastQuotaExhausted
-	if (!next) {
-		next = [...candidates].sort((a, b) => {
-			const timeA = a.lastQuotaExhausted ?? 0;
-			const timeB = b.lastQuotaExhausted ?? 0;
-			return timeA - timeB;
-		})[0];
-	}
-
+	const next = candidates.find((a) => !isAccountQuotaExhausted(a, now));
 	if (!next) {
 		return { rotated: false, previousEmail: currentEmail ?? null };
 	}
@@ -507,4 +543,71 @@ export function rotateToNextAvailableAccount(currentEmail, options = {}) {
 		newEmail: next.email,
 		credential: switched.credential,
 	};
+}
+
+/**
+ * Paths for the account index that lives beside a credential file.
+ * @param {{
+ *   credentialPath?: string,
+ *   accountsDir?: string,
+ *   indexPath?: string,
+ * }} options
+ */
+function accountLocations(options) {
+	const credentialPath = options.credentialPath;
+	const baseDir = credentialPath ? path.dirname(credentialPath) : undefined;
+	return {
+		credentialPath,
+		accountsDir: options.accountsDir ?? (baseDir ? path.join(baseDir, "accounts") : undefined),
+		indexPath: options.indexPath ?? (baseDir ? path.join(baseDir, "accounts.json") : undefined),
+	};
+}
+
+/**
+ * Call `run` with the current credential. On a quota error, before any output,
+ * mark that account and try the next one that is outside its cooldown.
+ * @param {{
+ *   credential: object,
+ *   run: (credential: object) => Promise<any>,
+ *   autoRotate?: boolean,
+ *   canRotate?: () => boolean,
+ *   onRotate?: (info: { from?: string, to: string }) => void,
+ *   credentialPath?: string,
+ *   accountsDir?: string,
+ *   indexPath?: string,
+ *   sessionPath?: string,
+ * }} options
+ */
+export async function withQuotaRotation(options) {
+	const locations = accountLocations(options);
+	let currentCredential = options.credential;
+	const tried = new Set();
+	const remember = (email) => {
+		const key = canonicalAccountEmail(email);
+		if (key) tried.add(key);
+	};
+	remember(currentCredential?.email);
+	while (true) {
+		try {
+			return await options.run(currentCredential);
+		} catch (error) {
+			const canRotate = options.canRotate ? options.canRotate() : true;
+			if (options.autoRotate === false || !canRotate || !isQuotaError(error)) throw error;
+			const currentEmail = currentCredential?.email;
+			if (currentEmail) markQuotaExhausted(currentEmail, locations);
+			const rotation = rotateToNextAvailableAccount(currentEmail, locations);
+			const nextKey = canonicalAccountEmail(rotation.newEmail);
+			if (!rotation.rotated || !rotation.credential || !nextKey || tried.has(nextKey)) throw error;
+			tried.add(nextKey);
+			options.onRotate?.({ from: currentEmail, to: rotation.newEmail });
+			currentCredential = rotation.credential;
+			if (options.sessionPath) {
+				try {
+					saveSession({}, options.sessionPath);
+				} catch {
+					// The next account still starts from whatever session is on disk.
+				}
+			}
+		}
+	}
 }

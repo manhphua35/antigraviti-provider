@@ -15,7 +15,7 @@ import { LoginCancelledError, OAuthError } from "./errors.js";
 import { openBrowser } from "./open-browser.js";
 import { exchangeAuthorizationCode, fetchUserEmail, generateState, refreshAccessToken, buildAuthorizeUrl } from "./oauth.js";
 import { googleAntigravityProjectHook } from "./project.js";
-import { defaultCredentialPath, saveCredentials } from "./store.js";
+import { defaultCredentialPath } from "./store.js";
 import { upsertAccount } from "./accounts.js";
 import { ensureAntigravityVersion } from "./user-agent.js";
 

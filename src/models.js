@@ -328,7 +328,7 @@ function decorateModel(model) {
 		requiresSkipThoughtSignatureOnFirstFunctionCall: gemini && gemini3,
 		multimodalFunctionResponse: anthropic || (gemini && gemini3),
 		flashStreamLeakWorkaround: flash,
-		streamFirstEventTimeoutMs: flash ? 60_000 : undefined,
+		streamFirstEventTimeoutMs: 300_000,
 	};
 	if (anthropic) compat.antigravityUsageLabel = "true";
 	const next = {

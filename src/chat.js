@@ -72,7 +72,7 @@ function textOf(content) {
 function imageFromUrl(url) {
 	const data = /^data:([^;,]+)?(?:;base64)?,([\s\S]*)$/.exec(url);
 	if (data) return { type: "image", mimeType: data[1] || "image/png", data: data[2] ?? "" };
-	return { type: "image", url, mimeType: "image/png" };
+	throw new ChatRequestError("Image URLs must be data URLs (data:image/...;base64,...). Remote image links are not sent upstream.");
 }
 
 /**

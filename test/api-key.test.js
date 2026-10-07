@@ -92,6 +92,30 @@ describe("api-key CRUD and management", () => {
 		}
 	});
 
+	it("does not restore a deleted legacy key", () => {
+		const env = setupKeyEnv();
+		try {
+			fs.writeFileSync(env.singleKeyFile, "ag-legacy\n");
+			loadApiKeysStore(env.storePath, env.singleKeyFile);
+			assert.equal(listApiKeys(env).length, 1);
+
+			deleteApiKey("ag-legacy", env);
+			assert.equal(fs.existsSync(env.singleKeyFile), false);
+			assert.equal(listApiKeys(env).length, 0);
+			fs.writeFileSync(env.singleKeyFile, "ag-legacy\n");
+			assert.equal(loadApiKeysStore(env.storePath, env.singleKeyFile).keys["ag-legacy"], undefined);
+			assert.equal(
+				validateApiKey("ag-legacy", { masterKey: "ag-legacy", storePath: env.storePath, singleKeyFile: env.singleKeyFile }).valid,
+				false,
+			);
+
+			createApiKey({ name: "back", key: "ag-legacy" }, env);
+			assert.equal(validateApiKey("ag-legacy", { storePath: env.storePath }).valid, true);
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+
 	it("validates keys correctly including disabled status", () => {
 		const env = setupKeyEnv();
 		try {

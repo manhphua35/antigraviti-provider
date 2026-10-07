@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
+import { listAccounts } from "../src/accounts.js";
 import { generateAntigravity, listAntigravityModels, selectAntigravityEndpoints } from "../src/generate.js";
 import {
 	ANTIGRAVITY_DAILY_ENDPOINT,
@@ -213,6 +214,48 @@ describe("Antigravity generate", () => {
 		assert.equal(loadCredentials(file).access, "new-access");
 		assert.equal(loadCredentials(file).projectId, "project-123");
 		assert.equal(loadCredentials(file).refresh, "refresh-token");
+		const accounts = listAccounts({
+			credentialPath: file,
+			accountsDir: path.join(dir, "accounts"),
+			indexPath: path.join(dir, "accounts.json"),
+		});
+		assert.equal(accounts.length, 1);
+		assert.equal(accounts[0].email, "user@example.com");
+		assert.ok(accounts[0].expires > Date.now());
+	});
+
+	it("retries a first-event timeout with a new abort signal", async () => {
+		let streamCalls = 0;
+		const fetchImpl = async (url, init) => {
+			const href = String(url);
+			if (href.includes("manifest")) return new Response("version: 2.8.0\n");
+			streamCalls += 1;
+			if (streamCalls === 1) {
+				await new Promise((resolve, reject) => {
+					const timer = setTimeout(() => reject(new Error("timed out waiting for abort")), 2000);
+					const onAbort = () => {
+						clearTimeout(timer);
+						reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+					};
+					if (init.signal?.aborted) onAbort();
+					else init.signal?.addEventListener("abort", onAbort, { once: true });
+				});
+			}
+			if (init.signal?.aborted) throw Object.assign(new Error("signal was already aborted"), { name: "AbortError" });
+			return sse([textEvent("retried")]);
+		};
+		const result = await generateAntigravity({
+			credential: credential(),
+			models: models(),
+			prompt: "hi",
+			endpointMode: "production",
+			firstEventTimeoutMs: 30,
+			maxRetryDelayMs: 0,
+			sleep: async () => {},
+			fetch: fetchImpl,
+		});
+		assert.equal(result.text, "retried");
+		assert.equal(streamCalls, 2);
 	});
 
 	it("rewrites VALIDATION_REQUIRED into the account verification message", async () => {

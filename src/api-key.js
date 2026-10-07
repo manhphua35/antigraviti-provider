@@ -7,6 +7,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { writeJsonAtomic } from "./store.js";
+
+/** @param {string} key */
+function keyDigest(key) {
+	return crypto.createHash("sha256").update(key).digest("hex");
+}
 
 /** @returns {string} Default path for the legacy single key file */
 export function defaultApiKeyPath() {
@@ -31,21 +37,43 @@ export function apiKeysMatch(provided, expected) {
 }
 
 /**
- * Atomic JSON write with 0600 mode.
- * @param {string} file
- * @param {object} data
+ * The legacy single-key file is imported only for the default store, or when
+ * the caller names the file. A temp store must not absorb the home directory key.
+ * @param {string} storePath
+ * @param {string | undefined} singleKeyFile
  */
-function writeJsonAtomic(file, data) {
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	const json = `${JSON.stringify(data, null, 2)}\n`;
-	const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
-	fs.writeFileSync(tmp, json, { encoding: "utf8", mode: 0o600 });
-	fs.renameSync(tmp, file);
-	try {
-		fs.chmodSync(file, 0o600);
-	} catch {
-		// chmod may not apply on Windows
-	}
+function legacyKeyFile(storePath, singleKeyFile) {
+	if (singleKeyFile) return singleKeyFile;
+	if (storePath === defaultApiKeysStorePath()) return defaultApiKeyPath();
+	return undefined;
+}
+
+/**
+ * @param {{ revoked?: string[] }} store
+ * @param {string} key
+ */
+function isRevoked(store, key) {
+	return Array.isArray(store.revoked) && store.revoked.includes(keyDigest(key));
+}
+
+/**
+ * @param {{ revoked?: string[] }} store
+ * @param {string} key
+ */
+function revokeKey(store, key) {
+	store.revoked ??= [];
+	const digest = keyDigest(key);
+	if (!store.revoked.includes(digest)) store.revoked.push(digest);
+}
+
+/**
+ * @param {{ revoked?: string[] }} store
+ * @param {string} key
+ */
+function unrevokeKey(store, key) {
+	if (!Array.isArray(store.revoked)) return;
+	const digest = keyDigest(key);
+	store.revoked = store.revoked.filter((item) => item !== digest);
 }
 
 /**
@@ -59,19 +87,23 @@ export function generateApiKey(prefix = "ag-") {
 /**
  * Load the API keys store.
  * Automatically imports the single legacy key file into the store if present.
+ * A deleted key is recorded under `revoked` so the legacy api-key file cannot recreate it.
  * @param {string} [storePath]
  * @param {string} [singleKeyFile]
- * @returns {{ keys: Record<string, { key: string, name: string, enabled: boolean, createdAt: number, updatedAt: number, lastUsedAt: number | null, usage: { requests: number, promptTokens: number, completionTokens: number, totalTokens: number } }> }}
+ * @returns {{ revoked: string[], keys: Record<string, { key: string, name: string, enabled: boolean, createdAt: number, updatedAt: number, lastUsedAt: number | null, usage: { requests: number, promptTokens: number, completionTokens: number, totalTokens: number } }> }}
  */
-export function loadApiKeysStore(storePath = defaultApiKeysStorePath(), singleKeyFile = defaultApiKeyPath()) {
-	/** @type {{ keys: Record<string, any> }} */
-	let store = { keys: {} };
+export function loadApiKeysStore(storePath = defaultApiKeysStorePath(), singleKeyFile) {
+	/** @type {{ revoked: string[], keys: Record<string, any> }} */
+	const store = { revoked: [], keys: {} };
 
 	if (fs.existsSync(storePath)) {
 		try {
 			const parsed = JSON.parse(fs.readFileSync(storePath, "utf8"));
 			if (parsed && typeof parsed === "object" && parsed.keys && typeof parsed.keys === "object") {
 				store.keys = parsed.keys;
+			}
+			if (Array.isArray(parsed?.revoked)) {
+				store.revoked = parsed.revoked.filter((item) => typeof item === "string");
 			}
 		} catch {
 			// Corrupt store will be rebuilt
@@ -80,11 +112,12 @@ export function loadApiKeysStore(storePath = defaultApiKeysStorePath(), singleKe
 
 	let modified = false;
 
-	// Check if legacy single key file exists and import if not in store
-	if (fs.existsSync(singleKeyFile)) {
+	// Import the legacy file once. A revoked digest is never imported again.
+	const legacyFile = legacyKeyFile(storePath, singleKeyFile);
+	if (legacyFile && fs.existsSync(legacyFile)) {
 		try {
-			const legacyKey = fs.readFileSync(singleKeyFile, "utf8").trim();
-			if (legacyKey && !store.keys[legacyKey]) {
+			const legacyKey = fs.readFileSync(legacyFile, "utf8").trim();
+			if (legacyKey && !store.keys[legacyKey] && !isRevoked(store, legacyKey)) {
 				store.keys[legacyKey] = {
 					key: legacyKey,
 					name: "default",
@@ -129,12 +162,13 @@ export function saveApiKeysStore(store, storePath = defaultApiKeysStorePath()) {
  */
 export function createApiKey(params = {}, options = {}) {
 	const storePath = options.storePath ?? defaultApiKeysStorePath();
-	const store = loadApiKeysStore(storePath);
+	const store = loadApiKeysStore(storePath, options.singleKeyFile);
 
 	const key = (params.key?.trim()) || generateApiKey();
 	if (store.keys[key]) {
 		throw new Error(`API key already exists.`);
 	}
+	unrevokeKey(store, key);
 
 	const name = (params.name?.trim()) || `key-${Date.now().toString(36)}`;
 	const record = {
@@ -163,7 +197,7 @@ export function createApiKey(params = {}, options = {}) {
  * @param {{ storePath?: string }} [options]
  */
 export function findApiKey(identifier, options = {}) {
-	const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath());
+	const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath(), options.singleKeyFile);
 	const id = identifier.trim().toLowerCase();
 
 	// Check by key
@@ -185,7 +219,7 @@ export function findApiKey(identifier, options = {}) {
  */
 export function updateApiKey(identifier, updates, options = {}) {
 	const storePath = options.storePath ?? defaultApiKeysStorePath();
-	const store = loadApiKeysStore(storePath);
+	const store = loadApiKeysStore(storePath, options.singleKeyFile);
 	const target = findApiKey(identifier, { storePath });
 
 	if (!target) {
@@ -212,7 +246,7 @@ export function updateApiKey(identifier, updates, options = {}) {
  */
 export function deleteApiKey(identifier, options = {}) {
 	const storePath = options.storePath ?? defaultApiKeysStorePath();
-	const store = loadApiKeysStore(storePath);
+	const store = loadApiKeysStore(storePath, options.singleKeyFile);
 	const target = findApiKey(identifier, { storePath });
 
 	if (!target) {
@@ -220,7 +254,16 @@ export function deleteApiKey(identifier, options = {}) {
 	}
 
 	delete store.keys[target.key];
+	revokeKey(store, target.key);
 	saveApiKeysStore(store, storePath);
+	const legacyFile = legacyKeyFile(storePath, options.singleKeyFile);
+	if (legacyFile && fs.existsSync(legacyFile)) {
+		try {
+			if (fs.readFileSync(legacyFile, "utf8").trim() === target.key) fs.rmSync(legacyFile, { force: true });
+		} catch {
+			// The revoked digest still rejects the key if the file remains.
+		}
+	}
 	return target;
 }
 
@@ -229,7 +272,7 @@ export function deleteApiKey(identifier, options = {}) {
  * @param {{ storePath?: string }} [options]
  */
 export function listApiKeys(options = {}) {
-	const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath());
+	const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath(), options.singleKeyFile);
 	return Object.values(store.keys).map((k) => ({
 		...k,
 		usage: { ...(k.usage ?? { requests: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0 }) },
@@ -244,10 +287,11 @@ export function listApiKeys(options = {}) {
  */
 export function validateApiKey(provided, options = {}) {
 	if (!provided) return { valid: false };
+	const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath(), options.singleKeyFile);
+	if (isRevoked(store, provided)) return { valid: false };
 
 	// 1. Check against master key if configured
 	if (options.masterKey && apiKeysMatch(provided, options.masterKey)) {
-		const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath());
 		const record = store.keys[options.masterKey];
 		if (record && record.enabled === false) {
 			return { valid: false };
@@ -256,7 +300,6 @@ export function validateApiKey(provided, options = {}) {
 	}
 
 	// 2. Check against keys store
-	const store = loadApiKeysStore(options.storePath ?? defaultApiKeysStorePath());
 	for (const record of Object.values(store.keys)) {
 		if (record.enabled !== false && apiKeysMatch(provided, record.key)) {
 			return { valid: true, key: record.key, record };
@@ -275,7 +318,7 @@ export function validateApiKey(provided, options = {}) {
 export function recordKeyUsage(key, stats = {}, options = {}) {
 	if (!key) return null;
 	const storePath = options.storePath ?? defaultApiKeysStorePath();
-	const store = loadApiKeysStore(storePath);
+	const store = loadApiKeysStore(storePath, options.singleKeyFile);
 
 	let record = store.keys[key];
 	if (!record) {
@@ -315,7 +358,7 @@ export function recordKeyUsage(key, stats = {}, options = {}) {
  */
 export function resetKeyUsage(identifier, options = {}) {
 	const storePath = options.storePath ?? defaultApiKeysStorePath();
-	const store = loadApiKeysStore(storePath);
+	const store = loadApiKeysStore(storePath, options.singleKeyFile);
 
 	let count = 0;
 	if (!identifier || identifier.toLowerCase() === "all") {

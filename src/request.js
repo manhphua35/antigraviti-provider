@@ -3,6 +3,7 @@
  * Mirrors `buildRequest(..., isAntigravity)` in oh-my-pi's google-gemini-cli provider.
  */
 import crypto from "node:crypto";
+import { AntigravityApiError } from "./errors.js";
 import { getAntigravityModelWireProfile, resolveThinking } from "./models.js";
 import { normalizeSchemaForCca } from "./schema.js";
 
@@ -284,8 +285,15 @@ function normalizeToolCallId(id) {
  * @param {{ mimeType?: string, data?: string, url?: string }} image
  */
 function convertImagePart(image) {
-	if (image.url) return { fileData: { fileUri: image.url, mimeType: image.mimeType } };
-	return { inlineData: { mimeType: image.mimeType, data: image.data } };
+	if (typeof image.data === "string" && image.data) {
+		return { inlineData: { mimeType: image.mimeType || "image/png", data: image.data } };
+	}
+	if (image.url) {
+		throw new AntigravityApiError("Image URLs must be inline data URLs. Remote image links are not sent upstream.", {
+			kind: "validation",
+		});
+	}
+	return { inlineData: { mimeType: image.mimeType || "image/png", data: image.data ?? "" } };
 }
 
 /**

@@ -2,14 +2,30 @@
  * Per-conversation Antigravity envelope: agent id, trajectory, step, and the
  * last Cloud Code Assist endpoint that returned a finished response.
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { writeJsonAtomic } from "./store.js";
 
 /**
- * @param {string} credentialPath
+ * Stable directory name for one client key. The raw key never appears in the path.
+ * @param {string} apiKey
  */
-export function sessionPathFor(credentialPath) {
-	return path.join(path.dirname(credentialPath), "session.json");
+export function sessionScopeForKey(apiKey) {
+	return crypto.createHash("sha256").update(String(apiKey ?? "")).digest("hex").slice(0, 32);
+}
+
+/**
+ * CLI calls share session.json. The HTTP server passes a per-key scope so
+ * unrelated clients do not advance one Antigravity trajectory.
+ * @param {string} credentialPath
+ * @param {string} [scope]
+ */
+export function sessionPathFor(credentialPath, scope) {
+	const dir = path.dirname(credentialPath);
+	if (!scope) return path.join(dir, "session.json");
+	const safe = String(scope).replace(/[^a-z0-9]/gi, "").slice(0, 64);
+	return path.join(dir, "sessions", `${safe}.json`);
 }
 
 /**
@@ -38,26 +54,12 @@ export function loadSession(file) {
  * @param {string} file
  */
 export function saveSession(state, file) {
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	const json = `${JSON.stringify(
-		{
-			agentId: state.agentId,
-			trajectoryId: state.trajectoryId,
-			sessionId: state.sessionId,
-			stepIndex: state.stepIndex,
-			lastExecutionId: state.lastExecutionId,
-			lastGoodEndpoint: state.lastGoodEndpoint,
-		},
-		null,
-		2,
-	)}\n`;
-	const tmp = `${file}.${process.pid}.tmp`;
-	fs.writeFileSync(tmp, json, { encoding: "utf8", mode: 0o600 });
-	fs.renameSync(tmp, file);
-	try {
-		fs.chmodSync(file, 0o600);
-	} catch {
-		// chmod is not meaningful on every Windows filesystem.
-	}
-	return file;
+	return writeJsonAtomic(file, {
+		agentId: state.agentId,
+		trajectoryId: state.trajectoryId,
+		sessionId: state.sessionId,
+		stepIndex: state.stepIndex,
+		lastExecutionId: state.lastExecutionId,
+		lastGoodEndpoint: state.lastGoodEndpoint,
+	});
 }

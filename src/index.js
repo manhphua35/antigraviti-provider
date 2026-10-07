@@ -2,7 +2,7 @@ export { loginAntigravity, refreshAntigravity } from "./login.js";
 export { ensureFreshCredential } from "./credential.js";
 export { buildAuthorizeUrl, exchangeAuthorizationCode, generateState, mapTokenResponse } from "./oauth.js";
 export { googleAntigravityProjectHook, discoverProject } from "./project.js";
-export { defaultCredentialPath, loadCredentials, saveCredentials, toStructuredApiKey } from "./store.js";
+export { defaultCredentialPath, loadCredentials, saveCredentials, writeJsonAtomic } from "./store.js";
 export {
 	defaultAccountsDir,
 	defaultAccountsIndexPath,
@@ -18,6 +18,7 @@ export {
 	markQuotaExhausted,
 	resetAccountQuota,
 	rotateToNextAvailableAccount,
+	withQuotaRotation,
 } from "./accounts.js";
 export { openBrowser, browserCommand } from "./open-browser.js";
 export { OAuthError, LoginCancelledError, AntigravityApiError } from "./errors.js";

@@ -54,7 +54,7 @@ describe("Antigravity catalog model", () => {
 		assert.equal(model.thinking.mode, "google-level");
 		assert.equal(resolveWireModelId(model, "medium"), "gemini-3.8-flash-medium");
 		assert.equal(model.compat.flashStreamLeakWorkaround, true);
-		assert.equal(model.compat.streamFirstEventTimeoutMs, 60_000);
+		assert.equal(model.compat.streamFirstEventTimeoutMs, 300_000);
 	});
 });
 

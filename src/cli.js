@@ -15,16 +15,14 @@ if (typeof globalThis.crypto === "undefined") {
 	globalThis.crypto = crypto.webcrypto;
 }
 import {
-	defaultAccountsDir,
-	isQuotaError,
 	listAccounts,
 	loadAccountsIndex,
-	markQuotaExhausted,
 	removeAccount,
 	resetAccountQuota,
 	rotateToNextAvailableAccount,
 	switchActiveAccount,
 	upsertAccount,
+	withQuotaRotation,
 } from "./accounts.js";
 import {
 	createApiKey,
@@ -41,7 +39,7 @@ import { generateAntigravity, listAntigravityModels } from "./generate.js";
 import { loginAntigravity, refreshAntigravity } from "./login.js";
 import { ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT, DEFAULT_MODEL_ID } from "./models.js";
 import { createChatServer, listen } from "./server.js";
-import { saveSession, sessionPathFor } from "./session.js";
+import { sessionPathFor } from "./session.js";
 import { defaultCredentialPath, loadCredentials, saveCredentials } from "./store.js";
 
 const HELP = `Sign in to Antigravity and call its models.
@@ -460,16 +458,22 @@ async function main() {
 		const prompt = args.prompt ?? (args.positionals.length > 0 ? args.positionals.join(" ") : await promptFromStdin());
 		const messageFile = args.messages ? readJsonFile(args.messages) : undefined;
 		const toolFile = args.tools ? readJsonFile(args.tools) : undefined;
-		let currentCredential = stored;
-		const triedAccounts = new Set();
-		if (currentCredential?.email) triedAccounts.add(currentCredential.email.toLowerCase());
-		let result;
-		while (true) {
-			try {
-				result = await generateAntigravity({
+		let outputStarted = false;
+		const sessionPath = sessionPathFor(file);
+		const result = await withQuotaRotation({
+			credential: stored,
+			autoRotate: args.autoRotate,
+			credentialPath: file,
+			sessionPath,
+			canRotate: () => !outputStarted,
+			onRotate(info) {
+				process.stderr.write(`[Auto-Quota] Account ${info.from ?? "unknown"} exceeded quota. Rotated to ${info.to}\n`);
+			},
+			run(currentCredential) {
+				return generateAntigravity({
 					credential: currentCredential,
 					credentialPath: file,
-					sessionPath: sessionPathFor(file),
+					sessionPath,
 					newSession: args.newSession,
 					model: args.model,
 					effort: args.effort,
@@ -482,34 +486,18 @@ async function main() {
 					temperature: args.temperature,
 					endpoint: args.endpoint,
 					endpointMode: args.endpointMode,
+					retryRateLimit: args.autoRotate === false,
 					onText(delta) {
+						if (delta) outputStarted = true;
 						if (!args.json) process.stdout.write(delta);
 					},
 					onThinking(delta) {
+						if (delta) outputStarted = true;
 						if (args.showThinking && !args.json) process.stderr.write(delta);
 					},
 				});
-				break;
-			} catch (error) {
-				if (args.autoRotate && isQuotaError(error)) {
-					const currentEmail = currentCredential?.email;
-					if (currentEmail) markQuotaExhausted(currentEmail);
-					const rotation = rotateToNextAvailableAccount(currentEmail, { credentialPath: file });
-					if (rotation.rotated && rotation.credential && rotation.newEmail && !triedAccounts.has(rotation.newEmail.toLowerCase())) {
-						triedAccounts.add(rotation.newEmail.toLowerCase());
-						process.stderr.write(`[Auto-Quota] Account ${currentEmail ?? "unknown"} exceeded quota. Rotated to ${rotation.newEmail}\n`);
-						currentCredential = rotation.credential;
-						try {
-							saveSession({}, sessionPathFor(file));
-						} catch {
-							// Best effort
-						}
-						continue;
-					}
-				}
-				throw error;
-			}
-		}
+			},
+		});
 		if (args.json) {
 			process.stdout.write(
 				`${JSON.stringify(
