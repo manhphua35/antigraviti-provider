@@ -1,0 +1,42 @@
+# Log in once, then start the server. Both share the credential volume.
+#
+#   docker compose --profile login run --rm login
+#   docker compose up -d --build
+#
+# Login uses the host network so the browser can reach
+# http://127.0.0.1:51121/oauth-callback. That works on Linux.
+# The server is published on http://127.0.0.1:8787.
+
+services:
+  server:
+    build: .
+    image: antigravity-provider
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      HOME: /data
+    volumes:
+      - antigravity-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  login:
+    profiles: ["login"]
+    image: antigravity-provider
+    build: .
+    network_mode: host
+    stdin_open: true
+    tty: true
+    environment:
+      HOME: /data
+    volumes:
+      - antigravity-data:/data
+    command: ["node", "src/cli.js", "login", "--no-browser"]
+
+volumes:
+  antigravity-data:

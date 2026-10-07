@@ -1,0 +1,18 @@
+{
+	"name": "antigravity-provider",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"description": "Antigravity OAuth login, Cloud Code Assist calls, and a local gemini-3.8-flash server",
+	"engines": {
+		"node": ">=18"
+	},
+	"bin": {
+		"antigravity-login": "./src/cli.js"
+	},
+	"scripts": {
+		"login": "node src/cli.js login",
+		"serve": "node src/cli.js serve",
+		"test": "node --test ./test/oauth.test.js ./test/project.test.js ./test/callback.test.js ./test/open-browser.test.js ./test/login.test.js ./test/models.test.js ./test/request.test.js ./test/generate.test.js ./test/server.test.js"
+	}
+}

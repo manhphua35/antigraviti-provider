@@ -1,0 +1,7 @@
+oh-my-pi
+.git
+node_modules
+test
+*.log
+*.tmp
+credentials.json
