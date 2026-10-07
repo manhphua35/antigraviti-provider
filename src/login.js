@@ -8,13 +8,15 @@
  *
  * The browser callback and a pasted redirect URL race. Whichever arrives first wins.
  */
+import path from "node:path";
 import { CALLBACK_TIMEOUT_MS, LOGIN_INSTRUCTIONS, PROVIDER } from "./config.js";
 import { parseCallbackInput, startCallbackServer } from "./callback.js";
 import { LoginCancelledError, OAuthError } from "./errors.js";
 import { openBrowser } from "./open-browser.js";
 import { exchangeAuthorizationCode, fetchUserEmail, generateState, refreshAccessToken, buildAuthorizeUrl } from "./oauth.js";
 import { googleAntigravityProjectHook } from "./project.js";
-import { saveCredentials } from "./store.js";
+import { defaultCredentialPath, saveCredentials } from "./store.js";
+import { upsertAccount } from "./accounts.js";
 import { ensureAntigravityVersion } from "./user-agent.js";
 
 /**
@@ -132,7 +134,22 @@ export async function loginAntigravity(options = {}) {
 			authorizedAt: Date.now(),
 		};
 		if (options.save !== false) {
-			credential.credentialPath = saveCredentials(credential, options.credentialPath);
+			const credPath = options.credentialPath ?? defaultCredentialPath();
+			const baseDir = path.dirname(credPath);
+			const accountsDir = options.accountsDir ?? path.join(baseDir, "accounts");
+			const indexPath = options.indexPath ?? path.join(baseDir, "accounts.json");
+			const saved = upsertAccount(credential, {
+				credentialPath: credPath,
+				accountsDir,
+				indexPath,
+			});
+			credential.credentialPath = credPath;
+			credential.savedAccountPath = saved.file;
+			credential.isNewAccount = saved.isNewAccount;
+			credential.detectedDifferentAccount = Boolean(
+				saved.previousActive && saved.previousActive.toLowerCase() !== credential.email.toLowerCase(),
+			);
+			credential.previousAccount = saved.previousActive;
 		}
 		return credential;
 	} finally {

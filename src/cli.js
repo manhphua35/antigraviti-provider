@@ -7,15 +7,41 @@
  *   node src/cli.js generate --model gemini-3.1-pro --effort high --prompt "Hello"
  *   node src/cli.js serve
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import readline from "node:readline";
-import { defaultApiKeyPath, resolveServerApiKey } from "./api-key.js";
+
+if (typeof globalThis.crypto === "undefined") {
+	globalThis.crypto = crypto.webcrypto;
+}
+import {
+	defaultAccountsDir,
+	isQuotaError,
+	listAccounts,
+	loadAccountsIndex,
+	markQuotaExhausted,
+	removeAccount,
+	resetAccountQuota,
+	rotateToNextAvailableAccount,
+	switchActiveAccount,
+	upsertAccount,
+} from "./accounts.js";
+import {
+	createApiKey,
+	defaultApiKeyPath,
+	defaultApiKeysStorePath,
+	deleteApiKey,
+	listApiKeys,
+	resetKeyUsage,
+	resolveServerApiKey,
+	updateApiKey,
+} from "./api-key.js";
 import { DEFAULT_SERVER_EFFORT, SERVER_MODEL_ID } from "./chat.js";
 import { generateAntigravity, listAntigravityModels } from "./generate.js";
 import { loginAntigravity, refreshAntigravity } from "./login.js";
 import { ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT, DEFAULT_MODEL_ID } from "./models.js";
 import { createChatServer, listen } from "./server.js";
-import { sessionPathFor } from "./session.js";
+import { saveSession, sessionPathFor } from "./session.js";
 import { defaultCredentialPath, loadCredentials, saveCredentials } from "./store.js";
 
 const HELP = `Sign in to Antigravity and call its models.
@@ -24,6 +50,16 @@ Usage:
   node src/cli.js login [--no-browser] [--port 51121] [--out file] [--code value]
   node src/cli.js refresh [--out file]
   node src/cli.js status [--out file]
+  node src/cli.js accounts [list] [--json]
+  node src/cli.js accounts use <email>
+  node src/cli.js accounts rotate
+  node src/cli.js accounts reset-quota [email]
+  node src/cli.js accounts remove <email>
+  node src/cli.js keys [list] [--json]
+  node src/cli.js keys add [--name text] [--key value]
+  node src/cli.js keys edit <key_or_name> [--name text] [--enable | --disable]
+  node src/cli.js keys reset-usage [key_or_name|all]
+  node src/cli.js keys remove <key_or_name>
   node src/cli.js models [--out file] [--json] [--endpoint-mode auto|production|sandbox]
   node src/cli.js generate [--model id] [--effort off|minimal|low|medium|high] [--prompt text]
                          [--system text] [--max-tokens n] [--temperature n]
@@ -31,23 +67,30 @@ Usage:
                          [--new-session] [--messages file] [--tools file]
   node src/cli.js serve [--host 127.0.0.1] [--port 8787] [--api-key value]
                         [--api-key-file file] [--endpoint-mode auto|production|sandbox]
+                        [--auto-rotate | --no-auto-rotate]
 
 login opens the browser and listens on http://127.0.0.1:51121/oauth-callback.
-On Windows the browser is opened with PowerShell. On Linux it uses xdg-open
-(wslview under WSL). You can also paste the redirect URL if the callback cannot
-reach this machine.
+Each Gmail account is automatically detected and saved to its own file in
+~/.antigravity-provider/accounts/<email>.json.
+
+accounts lists and manages your Gmail accounts. When multiple accounts are
+signed in, serve automatically rotates to the next available account if one hits
+its 5-hour or weekly quota limit.
+
+keys manages client API keys and tracks request counts and token consumption per key.
 
 models lists the logical models for the signed-in account. generate sends the
 prompt to the selected model. The default model is ${DEFAULT_MODEL_ID}.
 --effort selects the thinking tier and the upstream wire id.
 
-serve listens for POST /v1/chat/completions. Every call uses ${SERVER_MODEL_ID}.
+serve listens for POST /v1/chat/completions and GET /v1/models. Every call uses ${SERVER_MODEL_ID}.
 effort defaults to ${DEFAULT_SERVER_EFFORT}. Send the API key as
 Authorization: Bearer <key>, x-api-key, or JSON apiKey. Prompts, messages,
 and tools are forwarded. The key is --api-key, else ANTIGRAVITY_API_KEY, else
 ~/.antigravity-provider/api-key (created on first start).
 
-Credentials are saved to ~/.antigravity-provider/credentials.json
+Active credentials are synced to ~/.antigravity-provider/credentials.json
+Individual accounts live in ~/.antigravity-provider/accounts/
 The conversation envelope is saved next to that file as session.json.
 Tokens are never printed.
 `;
@@ -64,6 +107,7 @@ function parseArgs(argv) {
 		json: false,
 		showThinking: false,
 		newSession: false,
+		autoRotate: true,
 		positionals: [],
 	};
 	const rest = argv.slice(2);
@@ -80,6 +124,8 @@ function parseArgs(argv) {
 		else if (flag === "--json") args.json = true;
 		else if (flag === "--show-thinking") args.showThinking = true;
 		else if (flag === "--new-session") args.newSession = true;
+		else if (flag === "--auto-rotate") args.autoRotate = true;
+		else if (flag === "--no-auto-rotate") args.autoRotate = false;
 		else if (flag === "--port") args.port = Number(take(flag, i++));
 		else if (flag === "--out") args.out = take(flag, i++);
 		else if (flag === "--code") args.code = take(flag, i++);
@@ -96,6 +142,10 @@ function parseArgs(argv) {
 		else if (flag === "--host") args.host = take(flag, i++);
 		else if (flag === "--api-key") args.apiKey = take(flag, i++);
 		else if (flag === "--api-key-file") args.apiKeyFile = take(flag, i++);
+		else if (flag === "--name") args.name = take(flag, i++);
+		else if (flag === "--key") args.key = take(flag, i++);
+		else if (flag === "--enable") args.enable = true;
+		else if (flag === "--disable") args.disable = true;
 		else if (flag.startsWith("-")) throw new Error(`Unknown argument: ${flag}`);
 		else args.positionals.push(flag);
 	}
@@ -113,7 +163,13 @@ function parseArgs(argv) {
 	}
 	const efforts = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 	if (args.effort !== undefined && !efforts.has(args.effort)) throw new Error(`Invalid --effort: ${args.effort}`);
-	if (args.command !== "generate" && args.positionals.length > 0) {
+	if (
+		args.command !== "generate" &&
+		args.command !== "accounts" &&
+		args.command !== "keys" &&
+		args.command !== "api-keys" &&
+		args.positionals.length > 0
+	) {
 		throw new Error(`Unknown argument: ${args.positionals[0]}`);
 	}
 	return args;
@@ -188,6 +244,151 @@ async function main() {
 		return;
 	}
 
+	if (args.command === "accounts") {
+		const action = args.positionals[0] ?? "list";
+		const targetEmail = args.positionals[1];
+
+		if (action === "list" || action === "ls") {
+			const accounts = listAccounts();
+			if (args.json) {
+				process.stdout.write(`${JSON.stringify(accounts, null, 2)}\n`);
+				return;
+			}
+			if (accounts.length === 0) {
+				process.stdout.write("No accounts found. Sign in with: node src/cli.js login\n");
+				return;
+			}
+			process.stdout.write(`Accounts (${accounts.length} total, Auto-Quota rotation ready):\n`);
+			for (const acc of accounts) {
+				const marker = acc.isActive ? " * " : "   ";
+				const activeTag = acc.isActive ? " [active]" : "";
+				const quotaTag = acc.quotaStatus === "exhausted" ? "EXHAUSTED" : "OK";
+				const expiryTag = acc.isExpired ? "Expired" : "Valid";
+				process.stdout.write(`${marker}${acc.email}${activeTag}\n`);
+				if (acc.projectId) process.stdout.write(`       Project: ${acc.projectId}\n`);
+				process.stdout.write(`       Quota:   ${quotaTag}${acc.lastQuotaExhausted ? ` (since ${new Date(acc.lastQuotaExhausted).toLocaleTimeString()})` : ""}\n`);
+				process.stdout.write(`       Token:   ${expiryTag}\n`);
+				if (acc.file) process.stdout.write(`       File:    ${acc.file}\n`);
+			}
+			return;
+		}
+
+		if (action === "use" || action === "switch") {
+			if (!targetEmail) throw new Error("Specify the email to use: node src/cli.js accounts use <email>");
+			const switched = switchActiveAccount(targetEmail);
+			process.stdout.write(`Active account switched to ${switched.email}\n`);
+			process.stdout.write(`Synced credentials to: ${defaultCredentialPath()}\n`);
+			return;
+		}
+
+		if (action === "rotate") {
+			const index = loadAccountsIndex();
+			const result = rotateToNextAvailableAccount(index.active);
+			if (!result.rotated) {
+				process.stdout.write(`Cannot rotate: no alternative account available (current: ${index.active ?? "none"}).\n`);
+				return;
+			}
+			process.stdout.write(`Rotated from ${result.previousEmail ?? "none"} to ${result.newEmail}\n`);
+			process.stdout.write(`Synced credentials to: ${defaultCredentialPath()}\n`);
+			return;
+		}
+
+		if (action === "reset-quota" || action === "reset") {
+			const count = resetAccountQuota(targetEmail ?? "all");
+			process.stdout.write(`Reset quota status for ${count} account(s).\n`);
+			return;
+		}
+
+		if (action === "remove" || action === "rm" || action === "delete") {
+			if (!targetEmail) throw new Error("Specify the email to remove: node src/cli.js accounts remove <email>");
+			const result = removeAccount(targetEmail);
+			process.stdout.write(`Removed account ${result.removed}\n`);
+			if (result.active) {
+				process.stdout.write(`Active account is now: ${result.active}\n`);
+			} else {
+				process.stdout.write("No remaining accounts.\n");
+			}
+			return;
+		}
+
+		throw new Error(`Unknown accounts action "${action}". Use list, use, rotate, reset-quota, or remove.`);
+	}
+
+	if (args.command === "keys" || args.command === "api-keys") {
+		const action = args.positionals[0] ?? "list";
+		const identifier = args.positionals[1];
+
+		if (action === "list" || action === "ls") {
+			const keys = listApiKeys();
+			if (args.json) {
+				process.stdout.write(`${JSON.stringify(keys, null, 2)}\n`);
+				return;
+			}
+			if (keys.length === 0) {
+				process.stdout.write("No API keys found. Create one with: node src/cli.js keys add --name <name>\n");
+				return;
+			}
+			process.stdout.write(`API Keys (${keys.length} total):\n`);
+			for (const k of keys) {
+				const statusTag = k.enabled !== false ? "ENABLED" : "DISABLED";
+				const reqCount = k.usage?.requests ?? 0;
+				const promptTok = (k.usage?.promptTokens ?? 0).toLocaleString();
+				const compTok = (k.usage?.completionTokens ?? 0).toLocaleString();
+				const totalTok = (k.usage?.totalTokens ?? 0).toLocaleString();
+				const lastUsed = k.lastUsedAt ? new Date(k.lastUsedAt).toLocaleString() : "never";
+				process.stdout.write(`  Key:        ${k.key} [${statusTag}]\n`);
+				process.stdout.write(`    Name:     ${k.name}\n`);
+				process.stdout.write(`    Requests: ${reqCount}\n`);
+				process.stdout.write(`    Tokens:   ${totalTok} (prompt: ${promptTok}, completion: ${compTok})\n`);
+				process.stdout.write(`    Last used: ${lastUsed}\n\n`);
+			}
+			return;
+		}
+
+		if (action === "add" || action === "create") {
+			const record = createApiKey({
+				name: args.name,
+				key: args.key,
+			});
+			process.stdout.write(`Created new API key:\n`);
+			process.stdout.write(`  Key:  ${record.key}\n`);
+			process.stdout.write(`  Name: ${record.name}\n`);
+			return;
+		}
+
+		if (action === "edit" || action === "update") {
+			if (!identifier) throw new Error("Specify key or name: node src/cli.js keys edit <key_or_name> [--name <new_name>] [--enable|--disable]");
+			let enabled = undefined;
+			if (args.enable) enabled = true;
+			if (args.disable) enabled = false;
+			const updated = updateApiKey(identifier, {
+				name: args.name,
+				enabled,
+			});
+			const statusTag = updated.enabled ? "ENABLED" : "DISABLED";
+			process.stdout.write(`Updated API key ${updated.key}:\n`);
+			process.stdout.write(`  Name:   ${updated.name}\n`);
+			process.stdout.write(`  Status: ${statusTag}\n`);
+			return;
+		}
+
+		if (action === "reset-usage" || action === "reset") {
+			const target = identifier ?? (args.name ? args.name : "all");
+			const count = resetKeyUsage(target);
+			process.stdout.write(`Reset usage statistics for ${count} API key(s).\n`);
+			return;
+		}
+
+		if (action === "remove" || action === "rm" || action === "delete") {
+			if (!identifier) throw new Error("Specify key or name: node src/cli.js keys remove <key_or_name>");
+			const deleted = deleteApiKey(identifier);
+			process.stdout.write(`Deleted API key ${deleted.key} (${deleted.name})\n`);
+			return;
+		}
+
+		throw new Error(`Unknown keys action "${action}". Use list, add, edit, reset-usage, or remove.`);
+	}
+
 	if (args.command === "serve") {
 		readStored(file);
 		const apiKey = resolveServerApiKey({
@@ -197,18 +398,26 @@ async function main() {
 		});
 		const host = args.host ?? "127.0.0.1";
 		const port = args.port ?? 8787;
+		const accounts = listAccounts();
 		const server = createChatServer({
 			apiKey: apiKey.key,
 			credentialPath: file,
 			loadCredential: () => loadCredentials(file),
 			endpoint: args.endpoint,
 			endpointMode: args.endpointMode,
+			autoRotate: args.autoRotate,
+			onRotate(info) {
+				process.stdout.write(`[Auto-Quota] Account ${info.from} exceeded quota. Automatically rotated to ${info.to}\n`);
+			},
 		});
 		const address = await listen(server, { host, port });
 		const shownHost = host.includes(":") ? `[${host}]` : host;
 		process.stdout.write(`Antigravity server listening on http://${shownHost}:${address.port}\n`);
 		process.stdout.write(`Model: ${SERVER_MODEL_ID}\n`);
 		process.stdout.write(`Default effort: ${DEFAULT_SERVER_EFFORT}\n`);
+		if (accounts.length > 1) {
+			process.stdout.write(`Accounts: ${accounts.length} accounts loaded (Auto-Quota rotation: ${args.autoRotate ? "ON" : "OFF"})\n`);
+		}
 		process.stdout.write("POST /v1/chat/completions\n");
 		if (apiKey.created) process.stdout.write(`API key (saved to ${apiKey.path}): ${apiKey.key}\n`);
 		else if (apiKey.source === "file") process.stdout.write(`API key file: ${apiKey.path}\n`);
@@ -226,6 +435,11 @@ async function main() {
 		const stored = loadCredentials(file);
 		const credential = await refreshAntigravity(stored);
 		saveCredentials({ ...stored, ...credential }, file);
+		try {
+			upsertAccount({ ...stored, ...credential });
+		} catch {
+			// Best effort
+		}
 		printIdentity(credential, file);
 		return;
 	}
@@ -246,29 +460,56 @@ async function main() {
 		const prompt = args.prompt ?? (args.positionals.length > 0 ? args.positionals.join(" ") : await promptFromStdin());
 		const messageFile = args.messages ? readJsonFile(args.messages) : undefined;
 		const toolFile = args.tools ? readJsonFile(args.tools) : undefined;
-		const result = await generateAntigravity({
-			credential: stored,
-			credentialPath: file,
-			sessionPath: sessionPathFor(file),
-			newSession: args.newSession,
-			model: args.model,
-			effort: args.effort,
-			prompt,
-			messages: Array.isArray(messageFile) ? messageFile : messageFile?.messages,
-			systemPrompt: args.system ?? (Array.isArray(messageFile) ? undefined : messageFile?.systemPrompt),
-			tools: Array.isArray(toolFile) ? toolFile : toolFile?.tools,
-			toolChoice: Array.isArray(toolFile) ? undefined : toolFile?.toolChoice,
-			maxTokens: args.maxTokens,
-			temperature: args.temperature,
-			endpoint: args.endpoint,
-			endpointMode: args.endpointMode,
-			onText(delta) {
-				if (!args.json) process.stdout.write(delta);
-			},
-			onThinking(delta) {
-				if (args.showThinking && !args.json) process.stderr.write(delta);
-			},
-		});
+		let currentCredential = stored;
+		const triedAccounts = new Set();
+		if (currentCredential?.email) triedAccounts.add(currentCredential.email.toLowerCase());
+		let result;
+		while (true) {
+			try {
+				result = await generateAntigravity({
+					credential: currentCredential,
+					credentialPath: file,
+					sessionPath: sessionPathFor(file),
+					newSession: args.newSession,
+					model: args.model,
+					effort: args.effort,
+					prompt,
+					messages: Array.isArray(messageFile) ? messageFile : messageFile?.messages,
+					systemPrompt: args.system ?? (Array.isArray(messageFile) ? undefined : messageFile?.systemPrompt),
+					tools: Array.isArray(toolFile) ? toolFile : toolFile?.tools,
+					toolChoice: Array.isArray(toolFile) ? undefined : toolFile?.toolChoice,
+					maxTokens: args.maxTokens,
+					temperature: args.temperature,
+					endpoint: args.endpoint,
+					endpointMode: args.endpointMode,
+					onText(delta) {
+						if (!args.json) process.stdout.write(delta);
+					},
+					onThinking(delta) {
+						if (args.showThinking && !args.json) process.stderr.write(delta);
+					},
+				});
+				break;
+			} catch (error) {
+				if (args.autoRotate && isQuotaError(error)) {
+					const currentEmail = currentCredential?.email;
+					if (currentEmail) markQuotaExhausted(currentEmail);
+					const rotation = rotateToNextAvailableAccount(currentEmail, { credentialPath: file });
+					if (rotation.rotated && rotation.credential && rotation.newEmail && !triedAccounts.has(rotation.newEmail.toLowerCase())) {
+						triedAccounts.add(rotation.newEmail.toLowerCase());
+						process.stderr.write(`[Auto-Quota] Account ${currentEmail ?? "unknown"} exceeded quota. Rotated to ${rotation.newEmail}\n`);
+						currentCredential = rotation.credential;
+						try {
+							saveSession({}, sessionPathFor(file));
+						} catch {
+							// Best effort
+						}
+						continue;
+					}
+				}
+				throw error;
+			}
+		}
 		if (args.json) {
 			process.stdout.write(
 				`${JSON.stringify(
@@ -338,6 +579,12 @@ async function main() {
 	});
 	process.stdout.write("\n");
 	printIdentity(credential, credential.credentialPath ?? file);
+	if (credential.detectedDifferentAccount) {
+		process.stdout.write(`\n[Auto-Detect] Detected different Gmail account (previous active: ${credential.previousAccount}).\n`);
+		process.stdout.write(`[Auto-Detect] Saved to separate account file: ${credential.savedAccountPath}\n`);
+	} else if (credential.savedAccountPath) {
+		process.stdout.write(`Account file: ${credential.savedAccountPath}\n`);
+	}
 }
 
 /**

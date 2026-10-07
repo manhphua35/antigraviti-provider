@@ -67,6 +67,41 @@ function post(port, body, options = {}) {
 	});
 }
 
+/**
+ * @param {number} port
+ * @param {string} path
+ * @param {{ auth?: string | null, headers?: Record<string, string> }} [options]
+ */
+function get(port, path, options = {}) {
+	/** @type {Record<string, string>} */
+	const headers = { ...(options.headers ?? {}) };
+	if (options.auth !== null) headers.Authorization = `Bearer ${options.auth ?? "test-key"}`;
+	return new Promise((resolve, reject) => {
+		const req = http.request(
+			{
+				hostname: "127.0.0.1",
+				port,
+				path,
+				method: "GET",
+				headers,
+			},
+			(res) => {
+				const chunks = [];
+				res.on("data", (chunk) => chunks.push(chunk));
+				res.on("end", () => {
+					resolve({
+						status: res.statusCode,
+						type: res.headers["content-type"],
+						body: Buffer.concat(chunks).toString("utf8"),
+					});
+				});
+			},
+		);
+		req.on("error", reject);
+		req.end();
+	});
+}
+
 function result(options) {
 	return {
 		text: "Hello",
@@ -232,13 +267,14 @@ describe("chat server", () => {
 				return result(options);
 			},
 			{},
-			(port) => post(port, { stream: true, effort: "low", prompt: "Hi" }),
+			(port) => post(port, { stream: true, effort: "low", prompt: "Hi", stream_options: { include_usage: true } }),
 		);
 		assert.equal(response.status, 200);
 		assert.match(response.type, /text\/event-stream/);
 		assert.match(response.body, /"content":"Hel"/);
 		assert.match(response.body, /"content":"lo"/);
 		assert.match(response.body, /"name":"lookup"/);
+		assert.match(response.body, /"usage":\{"prompt_tokens":3/);
 		assert.match(response.body, /data: \[DONE\]/);
 	});
 
@@ -278,6 +314,44 @@ describe("chat server", () => {
 			});
 			assert.equal(response.status, 200);
 			assert.equal(JSON.parse(response.body).model, "gemini-3.8-flash");
+		});
+	});
+
+	it("rejects GET /v1/models with a missing or wrong API key", async () => {
+		await withServer(async (options) => result(options), {}, async (port) => {
+			const missing = await get(port, "/v1/models", { auth: null });
+			assert.equal(missing.status, 401);
+			const wrong = await get(port, "/v1/models", { auth: "wrong" });
+			assert.equal(wrong.status, 401);
+		});
+	});
+
+	it("returns list containing only gemini-3.8-flash for GET /v1/models", async () => {
+		await withServer(async (options) => result(options), {}, async (port) => {
+			const response = await get(port, "/v1/models");
+			assert.equal(response.status, 200);
+			const body = JSON.parse(response.body);
+			assert.equal(body.object, "list");
+			assert.equal(body.data.length, 1);
+			assert.equal(body.data[0].id, "gemini-3.8-flash");
+			assert.equal(body.data[0].object, "model");
+
+			const altResponse = await get(port, "/models");
+			assert.equal(altResponse.status, 200);
+			assert.deepEqual(JSON.parse(altResponse.body), body);
+		});
+	});
+
+	it("returns model object for GET /v1/models/gemini-3.8-flash and 404 for unknown models", async () => {
+		await withServer(async (options) => result(options), {}, async (port) => {
+			const ok = await get(port, "/v1/models/gemini-3.8-flash");
+			assert.equal(ok.status, 200);
+			const body = JSON.parse(ok.body);
+			assert.equal(body.id, "gemini-3.8-flash");
+			assert.equal(body.object, "model");
+
+			const notFound = await get(port, "/v1/models/gpt-4");
+			assert.equal(notFound.status, 404);
 		});
 	});
 });

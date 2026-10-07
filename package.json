@@ -13,6 +13,6 @@
 	"scripts": {
 		"login": "node src/cli.js login",
 		"serve": "node src/cli.js serve",
-		"test": "node --test ./test/oauth.test.js ./test/project.test.js ./test/callback.test.js ./test/open-browser.test.js ./test/login.test.js ./test/models.test.js ./test/request.test.js ./test/generate.test.js ./test/server.test.js"
+		"test": "node --test ./test/oauth.test.js ./test/project.test.js ./test/callback.test.js ./test/open-browser.test.js ./test/login.test.js ./test/models.test.js ./test/request.test.js ./test/generate.test.js ./test/server.test.js ./test/accounts.test.js ./test/api-key.test.js"
 	}
 }

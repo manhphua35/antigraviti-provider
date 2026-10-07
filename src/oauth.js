@@ -3,6 +3,7 @@
  * PKCE is not used. `access_type=offline` and `prompt=consent` are what make
  * Google return a refresh token.
  */
+import crypto from "node:crypto";
 import { AUTHORIZE_URL, EXPIRY_SKEW_MS, OAUTH_REQUEST_TIMEOUT_MS, PROVIDER, SCOPES, TOKEN_URL, USERINFO_URL, clientCredentials } from "./config.js";
 import { LoginCancelledError, OAuthError } from "./errors.js";
 
@@ -40,9 +41,7 @@ export async function oauthFetch(url, init, options = {}) {
 
 /** 16-byte hex CSRF state. */
 export function generateState() {
-	const bytes = new Uint8Array(16);
-	crypto.getRandomValues(bytes);
-	return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+	return crypto.randomBytes(16).toString("hex");
 }
 
 /**

@@ -232,6 +232,10 @@ export function normalizeChatRequest(body) {
 		topK: optionalNumber(body.topK ?? body.top_k, "top_k"),
 		presencePenalty: optionalNumber(body.presencePenalty ?? body.presence_penalty, "presence_penalty"),
 		stream: body.stream === true,
+		streamOptions:
+			typeof body.stream_options === "object" && body.stream_options !== null
+				? { includeUsage: Boolean(/** @type {any} */ (body.stream_options).include_usage) }
+				: undefined,
 	};
 }
 
@@ -297,5 +301,28 @@ export function formatChatChunk(id, delta, finishReason) {
 		object: "chat.completion.chunk",
 		model: SERVER_MODEL_ID,
 		choices: [{ index: 0, delta, finish_reason: finishReason }],
+	};
+}
+
+/**
+ * @param {string} [id]
+ */
+export function formatModelObject(id = SERVER_MODEL_ID) {
+	return {
+		id,
+		object: "model",
+		created: 1700000000,
+		owned_by: "google-antigravity",
+	};
+}
+
+/**
+ * Format the models list response in OpenAI format.
+ * Only gemini-3.8-flash is supported.
+ */
+export function formatModelsList() {
+	return {
+		object: "list",
+		data: [formatModelObject(SERVER_MODEL_ID)],
 	};
 }

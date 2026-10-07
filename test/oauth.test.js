@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { SCOPES, clientCredentials } from "../src/config.js";
-import { buildAuthorizeUrl, mapTokenResponse } from "../src/oauth.js";
+import { buildAuthorizeUrl, generateState, mapTokenResponse } from "../src/oauth.js";
 
 describe("Antigravity authorize URL", () => {
+	it("generates a 16-byte hex CSRF state", () => {
+		const state = generateState();
+		assert.equal(typeof state, "string");
+		assert.equal(state.length, 32);
+		assert.match(state, /^[0-9a-f]{32}$/);
+	});
+
 	it("uses the authorization-code grant without PKCE", () => {
 		const redirectUri = "http://127.0.0.1:51121/oauth-callback";
 		const url = new URL(buildAuthorizeUrl({ redirectUri, state: "abc123" }));

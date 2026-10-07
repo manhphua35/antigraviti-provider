@@ -3,6 +3,22 @@ export { ensureFreshCredential } from "./credential.js";
 export { buildAuthorizeUrl, exchangeAuthorizationCode, generateState, mapTokenResponse } from "./oauth.js";
 export { googleAntigravityProjectHook, discoverProject } from "./project.js";
 export { defaultCredentialPath, loadCredentials, saveCredentials, toStructuredApiKey } from "./store.js";
+export {
+	defaultAccountsDir,
+	defaultAccountsIndexPath,
+	accountFileName,
+	accountFilePath,
+	loadAccountsIndex,
+	saveAccountsIndex,
+	upsertAccount,
+	listAccounts,
+	switchActiveAccount,
+	removeAccount,
+	isQuotaError,
+	markQuotaExhausted,
+	resetAccountQuota,
+	rotateToNextAvailableAccount,
+} from "./accounts.js";
 export { openBrowser, browserCommand } from "./open-browser.js";
 export { OAuthError, LoginCancelledError, AntigravityApiError } from "./errors.js";
 export {
@@ -19,12 +35,30 @@ export {
 } from "./models.js";
 export { buildAntigravityRequest, deriveSignedDecimalFromHash } from "./request.js";
 export { listAntigravityModels, generateAntigravity, selectAntigravityEndpoints } from "./generate.js";
-export { defaultApiKeyPath, resolveServerApiKey, apiKeysMatch } from "./api-key.js";
+export {
+	defaultApiKeyPath,
+	defaultApiKeysStorePath,
+	resolveServerApiKey,
+	apiKeysMatch,
+	generateApiKey,
+	loadApiKeysStore,
+	saveApiKeysStore,
+	createApiKey,
+	findApiKey,
+	updateApiKey,
+	deleteApiKey,
+	listApiKeys,
+	validateApiKey,
+	recordKeyUsage,
+	resetKeyUsage,
+} from "./api-key.js";
 export {
 	SERVER_MODEL_ID,
 	DEFAULT_SERVER_EFFORT,
 	normalizeChatRequest,
 	formatChatCompletion,
+	formatModelsList,
+	formatModelObject,
 	readRequestApiKey,
 } from "./chat.js";
 export { createChatServer, listen } from "./server.js";

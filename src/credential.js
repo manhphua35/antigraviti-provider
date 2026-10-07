@@ -2,6 +2,8 @@
  * Use the saved login, refreshing the access token when it is inside the
  * Antigravity skew window. The stream itself refuses an already-expired token.
  */
+import fs from "node:fs";
+import path from "node:path";
 import { OAuthError } from "./errors.js";
 import { refreshAntigravity } from "./login.js";
 import { saveCredentials } from "./store.js";
@@ -28,6 +30,20 @@ export async function ensureFreshCredential(credential, options = {}) {
 	if (typeof expiresAt !== "number" || now + ANTIGRAVITY_REFRESH_SKEW_MS < expiresAt) return credential;
 	const refreshed = await refreshAntigravity(credential, { fetch: options.fetch, signal: options.signal });
 	const next = { ...credential, ...refreshed };
-	if (options.credentialPath && options.save !== false) saveCredentials(next, options.credentialPath);
+	if (options.credentialPath && options.save !== false) {
+		saveCredentials(next, options.credentialPath);
+		if (next.email) {
+			try {
+				const baseDir = path.dirname(options.credentialPath);
+				const safe = String(next.email).trim().toLowerCase().replace(/[/\\?%*:|"<>]/g, "_");
+				const accFile = path.join(baseDir, "accounts", `${safe}.json`);
+				if (fs.existsSync(accFile)) {
+					saveCredentials(next, accFile);
+				}
+			} catch {
+				// Best effort
+			}
+		}
+	}
 	return next;
 }
