@@ -17,6 +17,8 @@ async function withServer(generate, options, run) {
 		apiKey: options?.apiKey ?? "test-key",
 		credentialPath: options?.credentialPath ?? path.join(os.tmpdir(), "antigravity-provider-test-credentials.json"),
 		apiKeysPath: options?.apiKeysPath,
+		bodyLimit: options?.bodyLimit,
+		log: options?.log,
 		loadCredential: options?.loadCredential ?? (() => ({ access: "token", refresh: "refresh", projectId: "project-1" })),
 		generate,
 	});
@@ -335,6 +337,40 @@ describe("chat server", () => {
 		assert.equal(response.status, 400);
 		assert.equal(called, false);
 		assert.match(response.body, /Invalid effort/);
+	});
+
+	it("answers an oversized body with 413 instead of dropping the connection", async () => {
+		let called = false;
+		/** @type {string[]} */
+		const lines = [];
+		const image = "A".repeat(2 * 1024 * 1024);
+		const response = await withServer(
+			async () => {
+				called = true;
+				throw new Error("should not be called");
+			},
+			{ bodyLimit: 1024 * 1024, log: (line) => lines.push(line) },
+			(port) =>
+				post(port, {
+					messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/jpeg;base64,${image}` } }] }],
+				}),
+		);
+		assert.equal(response.status, 413);
+		assert.equal(called, false);
+		assert.match(response.body, /Request body is too large \(2\.0MB, limit 1\.0MB\)/);
+		assert.equal(lines.length, 1);
+		assert.match(lines[0], /^POST \/v1\/chat\/completions 413 body=2\.0MB \d+\.\ds error="Request body is too large/);
+	});
+
+	it("logs one line per completed POST", async () => {
+		/** @type {string[]} */
+		const lines = [];
+		const response = await withServer(async (options) => result(options), { log: (line) => lines.push(line) }, (port) =>
+			post(port, { prompt: "Hi" }),
+		);
+		assert.equal(response.status, 200);
+		assert.equal(lines.length, 1);
+		assert.match(lines[0], /^POST \/v1\/chat\/completions 200 body=0\.0MB \d+\.\ds$/);
 	});
 
 	it("reports a missing login as 503", async () => {

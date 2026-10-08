@@ -38,7 +38,7 @@ import { DEFAULT_SERVER_EFFORT, SERVER_MODEL_ID } from "./chat.js";
 import { generateAntigravity, listAntigravityModels } from "./generate.js";
 import { loginAntigravity, refreshAntigravity } from "./login.js";
 import { ANTIGRAVITY_DAILY_ENDPOINT, ANTIGRAVITY_SANDBOX_ENDPOINT, DEFAULT_MODEL_ID } from "./models.js";
-import { createChatServer, listen } from "./server.js";
+import { DEFAULT_BODY_LIMIT, MB, createChatServer, formatMegabytes, listen } from "./server.js";
 import { sessionPathFor } from "./session.js";
 import { defaultCredentialPath, loadCredentials, saveCredentials } from "./store.js";
 
@@ -65,7 +65,7 @@ Usage:
                          [--new-session] [--messages file] [--tools file]
   node src/cli.js serve [--host 127.0.0.1] [--port 8787] [--api-key value]
                         [--api-key-file file] [--endpoint-mode auto|production|sandbox]
-                        [--auto-rotate | --no-auto-rotate]
+                        [--auto-rotate | --no-auto-rotate] [--body-limit-mb n]
 
 login opens the browser and listens on http://127.0.0.1:51121/oauth-callback.
 Each Gmail account is automatically detected and saved to its own file in
@@ -85,7 +85,8 @@ serve listens for POST /v1/chat/completions and GET /v1/models. Every call uses 
 effort defaults to ${DEFAULT_SERVER_EFFORT}. Send the API key as
 Authorization: Bearer <key>, x-api-key, or JSON apiKey. Prompts, messages,
 and tools are forwarded. The key is --api-key, else ANTIGRAVITY_API_KEY, else
-~/.antigravity-provider/api-key (created on first start).
+~/.antigravity-provider/api-key (created on first start). Request bodies over
+--body-limit-mb (else ANTIGRAVITY_BODY_LIMIT_MB, else ${DEFAULT_BODY_LIMIT / MB}) get 413.
 
 Active credentials are synced to ~/.antigravity-provider/credentials.json
 Individual accounts live in ~/.antigravity-provider/accounts/
@@ -125,6 +126,7 @@ function parseArgs(argv) {
 		else if (flag === "--auto-rotate") args.autoRotate = true;
 		else if (flag === "--no-auto-rotate") args.autoRotate = false;
 		else if (flag === "--port") args.port = Number(take(flag, i++));
+		else if (flag === "--body-limit-mb") args.bodyLimitMb = Number(take(flag, i++));
 		else if (flag === "--out") args.out = take(flag, i++);
 		else if (flag === "--code") args.code = take(flag, i++);
 		else if (flag === "--model") args.model = take(flag, i++);
@@ -149,6 +151,9 @@ function parseArgs(argv) {
 	}
 	if (args.port !== undefined && (!Number.isInteger(args.port) || args.port < 0 || args.port > 65535)) {
 		throw new Error(`Invalid --port: ${args.port}`);
+	}
+	if (args.bodyLimitMb !== undefined && (!Number.isFinite(args.bodyLimitMb) || args.bodyLimitMb <= 0)) {
+		throw new Error(`Invalid --body-limit-mb: ${args.bodyLimitMb}`);
 	}
 	if (args.maxTokens !== undefined && (!Number.isFinite(args.maxTokens) || args.maxTokens <= 0)) {
 		throw new Error(`Invalid --max-tokens: ${args.maxTokens}`);
@@ -397,6 +402,14 @@ async function main() {
 		const host = args.host ?? "127.0.0.1";
 		const port = args.port ?? 8787;
 		const accounts = listAccounts();
+		// parseArgs already validated --body-limit-mb; only the env value is unchecked here.
+		const envBodyLimit = process.env.ANTIGRAVITY_BODY_LIMIT_MB;
+		const envBodyLimitMb = envBodyLimit ? Number(envBodyLimit) : undefined;
+		if (envBodyLimitMb !== undefined && (!Number.isFinite(envBodyLimitMb) || envBodyLimitMb <= 0)) {
+			throw new Error(`Invalid ANTIGRAVITY_BODY_LIMIT_MB: ${envBodyLimit}`);
+		}
+		const bodyLimitMb = args.bodyLimitMb ?? envBodyLimitMb;
+		const bodyLimit = bodyLimitMb !== undefined ? Math.floor(bodyLimitMb * MB) : DEFAULT_BODY_LIMIT;
 		const server = createChatServer({
 			apiKey: apiKey.key,
 			credentialPath: file,
@@ -404,6 +417,10 @@ async function main() {
 			endpoint: args.endpoint,
 			endpointMode: args.endpointMode,
 			autoRotate: args.autoRotate,
+			bodyLimit,
+			log(line) {
+				process.stdout.write(`${new Date().toISOString()} ${line}\n`);
+			},
 			onRotate(info) {
 				process.stdout.write(`[Auto-Quota] Account ${info.from} exceeded quota. Automatically rotated to ${info.to}\n`);
 			},
@@ -413,6 +430,7 @@ async function main() {
 		process.stdout.write(`Antigravity server listening on http://${shownHost}:${address.port}\n`);
 		process.stdout.write(`Model: ${SERVER_MODEL_ID}\n`);
 		process.stdout.write(`Default effort: ${DEFAULT_SERVER_EFFORT}\n`);
+		process.stdout.write(`Body limit: ${formatMegabytes(bodyLimit)}\n`);
 		if (accounts.length > 1) {
 			process.stdout.write(`Accounts: ${accounts.length} accounts loaded (Auto-Quota rotation: ${args.autoRotate ? "ON" : "OFF"})\n`);
 		}

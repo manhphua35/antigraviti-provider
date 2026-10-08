@@ -25,26 +25,38 @@ import { generateAntigravity } from "./generate.js";
 import { catalogAntigravityModel } from "./models.js";
 import { sessionPathFor, sessionScopeForKey } from "./session.js";
 
-const BODY_LIMIT = 8 * 1024 * 1024;
+export const MB = 1024 * 1024;
+export const DEFAULT_BODY_LIMIT = 20 * MB;
 
 /**
- * @param {import("node:http").IncomingMessage} req
+ * @param {number} bytes
  */
-function readBody(req) {
+export function formatMegabytes(bytes) {
+	return `${(bytes / MB).toFixed(1)}MB`;
+}
+
+/**
+ * Over the limit, drop the bytes but keep reading to the end. Destroying the
+ * request here would reset the socket before the 413 is written, and the client
+ * would only see a dropped connection. The caller checks `size` against the limit.
+ * @param {import("node:http").IncomingMessage} req
+ * @param {number} limit
+ * @returns {Promise<{ text: string, size: number }>}
+ */
+function readBody(req, limit) {
 	return new Promise((resolve, reject) => {
 		/** @type {Buffer[]} */
-		const chunks = [];
+		let chunks = [];
 		let size = 0;
 		req.on("data", (chunk) => {
 			size += chunk.length;
-			if (size > BODY_LIMIT) {
-				reject(new ChatRequestError("Request body is too large", 413));
-				req.destroy();
+			if (size > limit) {
+				chunks = [];
 				return;
 			}
 			chunks.push(chunk);
 		});
-		req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+		req.on("end", () => resolve({ text: Buffer.concat(chunks).toString("utf8"), size }));
 		req.on("error", reject);
 	});
 }
@@ -96,10 +108,13 @@ function errorStatus(error) {
  *   generate?: typeof generateAntigravity,
  *   endpoint?: string,
  *   endpointMode?: "auto" | "production" | "sandbox",
+ *   bodyLimit?: number,
+ *   log?: (line: string) => void,
  * }} options
  */
 export function createChatServer(options) {
 	const generate = options.generate ?? generateAntigravity;
+	const bodyLimit = options.bodyLimit ?? DEFAULT_BODY_LIMIT;
 	/** @type {Map<string, Promise<void>>} */
 	const callChains = new Map();
 	// One in-flight call per client key. Different keys do not share a trajectory, so they can run together.
@@ -122,6 +137,25 @@ export function createChatServer(options) {
 		const apiKeysPath = options.apiKeysPath ?? (baseDir ? path.join(baseDir, "api-keys.json") : undefined);
 		const accountsDir = options.accountsDir ?? (baseDir ? path.join(baseDir, "accounts") : undefined);
 		const accountsIndexPath = options.accountsIndexPath ?? (baseDir ? path.join(baseDir, "accounts.json") : undefined);
+		const startedAt = Date.now();
+		/** @type {number | undefined} */
+		let bodyBytes;
+		/** @type {string | undefined} */
+		let failure;
+		if (options.log && req.method === "POST") {
+			res.on("close", () => {
+				const status = res.writableFinished ? String(res.statusCode) : "aborted";
+				const fields = [req.method, url.pathname, status];
+				if (bodyBytes !== undefined) fields.push(`body=${formatMegabytes(bodyBytes)}`);
+				fields.push(`${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+				if (failure) fields.push(`error=${JSON.stringify(failure.slice(0, 300))}`);
+				try {
+					options.log(fields.join(" "));
+				} catch {
+					// Logging must not affect the response.
+				}
+			});
+		}
 		try {
 			if (req.method === "GET") {
 				if (url.pathname === "/" || url.pathname === "/health") {
@@ -158,10 +192,17 @@ export function createChatServer(options) {
 				sendError(res, req.method === "POST" ? 404 : 405, "Not found");
 				return;
 			}
-			const raw = await readBody(req);
+			const body = await readBody(req, bodyLimit);
+			bodyBytes = body.size;
+			if (body.size > bodyLimit) {
+				throw new ChatRequestError(
+					`Request body is too large (${formatMegabytes(body.size)}, limit ${formatMegabytes(bodyLimit)})`,
+					413,
+				);
+			}
 			let parsed;
 			try {
-				parsed = raw.trim() ? JSON.parse(raw) : {};
+				parsed = body.text.trim() ? JSON.parse(body.text) : {};
 			} catch {
 				sendError(res, 400, "Request body is not JSON");
 				return;
@@ -301,6 +342,7 @@ export function createChatServer(options) {
 				}
 			}
 		} catch (error) {
+			failure = error instanceof Error ? error.message : String(error);
 			try {
 				if (res.writableEnded || res.headersSent) {
 					res.end();
