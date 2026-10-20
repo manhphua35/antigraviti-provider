@@ -8,11 +8,16 @@ import path from "node:path";
 import { writeJsonAtomic } from "./store.js";
 
 /**
- * Stable directory name for one client key. The raw key never appears in the path.
+ * Stable directory name for one client key (and optional conversation seed).
+ * The raw key and conversation text never appear in the path.
  * @param {string} apiKey
+ * @param {string} [conversationSeed]
  */
-export function sessionScopeForKey(apiKey) {
-	return crypto.createHash("sha256").update(String(apiKey ?? "")).digest("hex").slice(0, 32);
+export function sessionScopeForKey(apiKey, conversationSeed) {
+	const base = String(apiKey ?? "");
+	const seed = typeof conversationSeed === "string" ? conversationSeed.trim() : "";
+	const input = seed ? `${base}\0${seed}` : base;
+	return crypto.createHash("sha256").update(input).digest("hex").slice(0, 32);
 }
 
 /**

@@ -1,8 +1,9 @@
 /**
  * Local chat server.
  * Callers send an API key, an optional effort (default medium), and the prompt,
- * messages, and tools. The server calls gemini-3.8-flash the way omp does:
- * straight to streamGenerateContent, with the session envelope kept across calls.
+ * messages, and tools. The default model is gemini-3.8-flash. A request that
+ * names gemini-4-argon uses that model. Calls go straight to
+ * streamGenerateContent, with the session envelope kept across calls.
  */
 import crypto from "node:crypto";
 import http from "node:http";
@@ -13,7 +14,9 @@ import {
 	ChatRequestError,
 	DEFAULT_SERVER_EFFORT,
 	SERVER_MODEL_ID,
+	SERVER_MODEL_IDS,
 	formatChatChunk,
+	formatUsage,
 	formatChatCompletion,
 	formatModelObject,
 	formatModelsList,
@@ -23,6 +26,7 @@ import {
 import { AntigravityApiError } from "./errors.js";
 import { generateAntigravity } from "./generate.js";
 import { catalogAntigravityModel } from "./models.js";
+import { conversationSeedForRequest } from "./request.js";
 import { sessionPathFor, sessionScopeForKey } from "./session.js";
 
 export const MB = 1024 * 1024;
@@ -180,8 +184,8 @@ export function createChatServer(options) {
 						return;
 					}
 					const requestedModel = url.pathname.replace(/^\/(?:v1\/)?models\//, "");
-					if (requestedModel === SERVER_MODEL_ID) {
-						sendJson(res, 200, formatModelObject(SERVER_MODEL_ID));
+					if (SERVER_MODEL_IDS.includes(requestedModel)) {
+						sendJson(res, 200, formatModelObject(requestedModel));
 						return;
 					}
 					sendError(res, 404, `The model '${requestedModel}' does not exist`);
@@ -229,17 +233,47 @@ export function createChatServer(options) {
 			let started = false;
 			const writeChunk = (chunk) => {
 				if (!started) {
+					res.socket?.setNoDelay(true);
 					res.writeHead(200, {
 						"Content-Type": "text/event-stream; charset=utf-8",
-						"Cache-Control": "no-cache",
+						"Cache-Control": "no-cache, no-transform",
 						Connection: "keep-alive",
+						"X-Accel-Buffering": "no",
 					});
+					res.flushHeaders?.();
 					started = true;
 				}
 				res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+				res.socket?.uncork?.();
+			};
+			const streamedToolIds = new Set();
+			let toolIndex = 0;
+			const writeTool = (call) => {
+				if (!chat.stream || !call?.id || streamedToolIds.has(call.id)) return;
+				streamedToolIds.add(call.id);
+				streamId ??= `chatcmpl-${crypto.randomUUID()}`;
+				writeChunk(
+					formatChatChunk(
+						streamId,
+						{
+							tool_calls: [
+								{
+									index: toolIndex,
+									id: call.id,
+									type: "function",
+									function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+								},
+							],
+						},
+						null,
+						chat.model,
+					),
+				);
+				toolIndex += 1;
 			};
 			const autoRotate = options.autoRotate !== false;
-			const sessionScope = sessionScopeForKey(keyAuth.key || presented || "anonymous");
+			const conversationSeed = conversationSeedForRequest(chat.messages, chat.prompt, req.headers, parsed);
+			const sessionScope = sessionScopeForKey(keyAuth.key || presented || "anonymous", conversationSeed);
 			const sessionPath = options.credentialPath ? sessionPathFor(options.credentialPath, sessionScope) : undefined;
 			const result = await enqueueCall(sessionScope, () =>
 				withQuotaRotation({
@@ -249,6 +283,7 @@ export function createChatServer(options) {
 					accountsDir,
 					indexPath: accountsIndexPath,
 					sessionPath,
+					model: chat.model,
 					canRotate: () => !started,
 					onRotate: options.onRotate,
 					run: (currentCredential) =>
@@ -273,48 +308,27 @@ export function createChatServer(options) {
 							sessionPath,
 							signal: abort.signal,
 							retryRateLimit: !autoRotate,
+							onThinking(delta) {
+								if (!chat.stream || !delta) return;
+								streamId ??= `chatcmpl-${crypto.randomUUID()}`;
+								writeChunk(formatChatChunk(streamId, { reasoning_content: delta }, null, chat.model));
+							},
 							onText(delta) {
 								if (!chat.stream || !delta) return;
 								streamId ??= `chatcmpl-${crypto.randomUUID()}`;
-								writeChunk(formatChatChunk(streamId, { content: delta }, null));
+								writeChunk(formatChatChunk(streamId, { content: delta }, null, chat.model));
 							},
+							onToolCall: writeTool,
 						}),
 				}),
 			);
 			if (chat.stream) {
 				streamId ??= `chatcmpl-${result.responseId ?? crypto.randomUUID()}`;
-				const calls = result.toolCalls ?? [];
-				if (calls.length > 0) {
-					writeChunk(
-						formatChatChunk(
-							streamId,
-							{
-								tool_calls: calls.map((call, index) => ({
-									index,
-									id: call.id,
-									type: "function",
-									function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
-								})),
-							},
-							null,
-						),
-					);
-				}
-				const finish = result.stopReason === "length" ? "length" : calls.length > 0 ? "tool_calls" : "stop";
-				writeChunk(formatChatChunk(streamId, {}, finish));
-				if (chat.streamOptions?.includeUsage) {
-					writeChunk({
-						id: streamId,
-						object: "chat.completion.chunk",
-						model: SERVER_MODEL_ID,
-						choices: [],
-						usage: {
-							prompt_tokens: result.usage?.input ?? 0,
-							completion_tokens: result.usage?.output ?? 0,
-							total_tokens: result.usage?.totalTokens ?? 0,
-						},
-					});
-				}
+				for (const call of result.toolCalls ?? []) writeTool(call);
+				const finish = result.stopReason === "length" ? "length" : (result.toolCalls ?? []).length > 0 ? "tool_calls" : "stop";
+				const done = formatChatChunk(streamId, {}, finish, chat.model);
+				done.usage = formatUsage(result.usage);
+				writeChunk(done);
 				res.end("data: [DONE]\n\n");
 				if (keyAuth.key) {
 					try {

@@ -457,7 +457,7 @@ export function convertTools(tools) {
 /**
  * @param {Array<object>} messages
  */
-function firstUserText(messages) {
+export function firstUserText(messages) {
 	for (const message of messages ?? []) {
 		if (message.role !== "user" && message.role !== "developer") continue;
 		if (typeof message.content === "string") return message.content;
@@ -465,6 +465,44 @@ function firstUserText(messages) {
 		return text;
 	}
 	return undefined;
+}
+
+/**
+ * Derive a stable conversation seed from the request's initial user/developer
+ * messages (skipping leading harness/developer boilerplate when a subsequent
+ * human prompt is present) so independent conversations and subagents sharing
+ * one API key do not collide onto a single trajectory.
+ * @param {Array<object>} [messages]
+ * @param {string} [prompt]
+ * @param {Record<string, unknown>} [headers]
+ * @param {Record<string, unknown>} [body]
+ */
+export function conversationSeedForRequest(messages, prompt, headers, body) {
+	for (const headerName of ["x-session-id", "session_id", "x-session-affinity", "x-client-request-id"]) {
+		const val = headers?.[headerName];
+		if (typeof val === "string" && val.trim()) return `hdr:${val.trim()}`;
+	}
+	for (const bodyKey of ["prompt_cache_key", "sessionId", "session_id", "conversation_id"]) {
+		const val = body?.[bodyKey];
+		if (typeof val === "string" && val.trim()) return `body:${val.trim()}`;
+	}
+	/** @type {string[]} */
+	const userTexts = [];
+	for (const message of messages ?? []) {
+		if (message.role !== "user" && message.role !== "developer") continue;
+		const text =
+			typeof message.content === "string"
+				? message.content.trim()
+				: (asBlocks(message.content).find((block) => block.type === "text")?.text ?? "").trim();
+		if (!text) continue;
+		userTexts.push(text);
+		if (userTexts.length >= 2) break;
+	}
+	if (userTexts.length === 0 && typeof prompt === "string" && prompt.trim()) {
+		userTexts.push(prompt.trim());
+	}
+	if (userTexts.length === 0) return "";
+	return userTexts.join("\n---\n");
 }
 
 /**
@@ -487,7 +525,7 @@ export function buildAntigravityRequestEnvelope(model, messages, wireModelId, st
 	}
 	const agentId = state?.agentId ?? uuid();
 	const trajectoryId = state?.trajectoryId ?? uuid();
-	const text = firstUserText(messages);
+	const text = conversationSeedForRequest(messages) || firstUserText(messages);
 	const sessionId =
 		state?.sessionId ?? (text && text.trim() ? deriveSignedDecimalFromHash(text) : sessionIdOf());
 	const step = state?.stepIndex ?? 2;

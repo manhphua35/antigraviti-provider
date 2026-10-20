@@ -141,6 +141,7 @@ describe("chat request", () => {
 		});
 		assert.equal(chat.model, SERVER_MODEL_ID);
 		assert.equal(chat.model, "gemini-3.8-flash");
+		assert.equal(normalizeChatRequest({ model: "gemini-4-argon", prompt: "Hi" }).model, "gemini-4-argon");
 		assert.equal(chat.effort, "medium");
 		assert.equal(chat.systemPrompt, "Be brief");
 		assert.deepEqual(chat.messages, [{ role: "user", content: "Hi" }]);
@@ -305,22 +306,53 @@ describe("chat server", () => {
 		}
 	});
 
-	it("streams text and tool calls", async () => {
+	it("streams reasoning, text, and tool calls as they arrive", async () => {
 		const response = await withServer(
 			async (options) => {
+				options.onThinking?.("plan");
 				options.onText?.("Hel");
 				options.onText?.("lo");
-				return result(options);
+				options.onToolCall?.({ id: "call_1", name: "lookup", arguments: { q: "x" } });
+				return {
+					...result(options),
+					usage: {
+						input: 3,
+						output: 9,
+						totalTokens: 14,
+						cacheRead: 2,
+						reasoningTokens: 5,
+						raw: { promptTokenCount: 5, cachedContentTokenCount: 2, trafficType: "ON_DEMAND" },
+					},
+				};
 			},
 			{},
 			(port) => post(port, { stream: true, effort: "low", prompt: "Hi", stream_options: { include_usage: true } }),
 		);
 		assert.equal(response.status, 200);
 		assert.match(response.type, /text\/event-stream/);
-		assert.match(response.body, /"content":"Hel"/);
-		assert.match(response.body, /"content":"lo"/);
-		assert.match(response.body, /"name":"lookup"/);
-		assert.match(response.body, /"usage":\{"prompt_tokens":3/);
+		const events = response.body
+			.split("\n\n")
+			.filter((part) => part.startsWith("data: ") && !part.includes("[DONE]"))
+			.map((part) => JSON.parse(part.slice("data: ".length)));
+		const kinds = events.map((event) => {
+			const delta = event.choices?.[0]?.delta ?? {};
+			if (delta.reasoning_content) return "reasoning";
+			if (delta.content) return "text";
+			if (delta.tool_calls) return "tool";
+			if (event.usage) return "usage";
+			return "other";
+		});
+		assert.deepEqual(kinds, ["reasoning", "text", "text", "tool", "usage"]);
+		assert.equal(response.body.split('"name":"lookup"').length - 1, 1);
+		assert.equal(events.at(-1).usage.prompt_tokens, 5);
+		assert.equal(events.at(-1).usage.completion_tokens, 9);
+		assert.equal(events.at(-1).usage.prompt_tokens_details.cached_tokens, 2);
+		assert.equal(events.at(-1).usage.prompt_cache_hit_tokens, 2);
+		assert.equal(events.at(-1).usage.prompt_cache_miss_tokens, 3);
+		assert.equal(events.at(-1).usage.trafficType, "ON_DEMAND");
+		assert.equal(events.at(-1).usage.usageMetadata.cachedContentTokenCount, 2);
+		assert.equal(events.at(-1).usage.completion_tokens_details.reasoning_tokens, 5);
+		assert.equal(events.at(-1).choices[0].finish_reason, "tool_calls");
 		assert.match(response.body, /data: \[DONE\]/);
 	});
 
@@ -406,14 +438,13 @@ describe("chat server", () => {
 		});
 	});
 
-	it("returns list containing only gemini-3.8-flash for GET /v1/models", async () => {
+	it("returns gemini-3.8-flash and gemini-4-argon for GET /v1/models", async () => {
 		await withServer(async (options) => result(options), {}, async (port) => {
 			const response = await get(port, "/v1/models");
 			assert.equal(response.status, 200);
 			const body = JSON.parse(response.body);
 			assert.equal(body.object, "list");
-			assert.equal(body.data.length, 1);
-			assert.equal(body.data[0].id, "gemini-3.8-flash");
+			assert.deepEqual(body.data.map((model) => model.id), ["gemini-3.8-flash", "gemini-4-argon"]);
 			assert.equal(body.data[0].object, "model");
 
 			const altResponse = await get(port, "/models");
@@ -432,7 +463,110 @@ describe("chat server", () => {
 
 			const notFound = await get(port, "/v1/models/gpt-4");
 			assert.equal(notFound.status, 404);
+
+			const argon = await get(port, "/v1/models/gemini-4-argon");
+			assert.equal(argon.status, 200);
+			assert.equal(JSON.parse(argon.body).id, "gemini-4-argon");
 		});
+	});
+
+	it("calls gemini-4-argon when the request names it", async () => {
+		const calls = [];
+		const response = await withServer(
+			async (options) => {
+				calls.push(options);
+				return {
+					...result(options),
+					model: "gemini-4-argon",
+					wireModelId: "gemini-4-argon-high",
+					effort: options.effort,
+				};
+			},
+			{},
+			(port) =>
+				post(port, {
+					model: "gemini-4-argon",
+					effort: "high",
+					messages: [{ role: "user", content: "Hi" }],
+				}),
+		);
+		assert.equal(response.status, 200);
+		const body = JSON.parse(response.body);
+		assert.equal(body.model, "gemini-4-argon");
+		assert.equal(body.effort, "high");
+		assert.equal(body.wireModelId, "gemini-4-argon-high");
+		assert.equal(calls[0].model, "gemini-4-argon");
+		assert.equal(calls[0].effort, "high");
+		assert.equal(calls[0].models[0].id, "gemini-4-argon");
+		assert.equal(calls[0].models[0].thinking.effortRouting.high, "gemini-4-argon-high");
+	});
+
+	it("runs distinct conversations concurrently under one API key while serializing same-conversation turns", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-parallel-test-"));
+		let active = 0;
+		let maxConcurrent = 0;
+		/** @type {Array<{ prompt: string, sessionPath: string }>} */
+		const seen = [];
+		try {
+			await withServer(
+				async (options) => {
+					active += 1;
+					maxConcurrent = Math.max(maxConcurrent, active);
+					const lastText = options.messages?.at(-1)?.content ?? options.prompt ?? "";
+					seen.push({ prompt: String(lastText), sessionPath: options.sessionPath });
+					await new Promise((resolve) => setTimeout(resolve, 40));
+					active -= 1;
+					return result(options);
+				},
+				{ credentialPath: path.join(dir, "credentials.json") },
+				async (port) => {
+					// Launch 3 subagents with shared developer boilerplate but distinct initial user tasks
+					const [subA, subB, subC] = await Promise.all([
+						post(port, {
+							messages: [
+								{ role: "developer", content: "Shared harness instructions" },
+								{ role: "user", content: "Subagent A: translate chapter 1" },
+							],
+						}),
+						post(port, {
+							messages: [
+								{ role: "developer", content: "Shared harness instructions" },
+								{ role: "user", content: "Subagent B: translate chapter 2" },
+							],
+						}),
+						post(port, {
+							messages: [
+								{ role: "developer", content: "Shared harness instructions" },
+								{ role: "user", content: "Subagent C: translate chapter 3" },
+							],
+						}),
+					]);
+					assert.equal(subA.status, 200);
+					assert.equal(subB.status, 200);
+					assert.equal(subC.status, 200);
+					assert.equal(maxConcurrent, 3, "Expected all 3 distinct subagents to execute in parallel");
+
+					const uniquePaths = new Set(seen.map((item) => item.sessionPath));
+					assert.equal(uniquePaths.size, 3, "Expected each subagent to get its own session trajectory file");
+
+					// A follow-up turn in Subagent A's conversation must reuse Subagent A's exact sessionPath
+					const subAFollowUp = await post(port, {
+						messages: [
+							{ role: "developer", content: "Shared harness instructions" },
+							{ role: "user", content: "Subagent A: translate chapter 1" },
+							{ role: "assistant", content: "Working on chapter 1" },
+							{ role: "user", content: "Continue chapter 1" },
+						],
+					});
+					assert.equal(subAFollowUp.status, 200);
+					const subAInitialPath = seen.find((item) => item.prompt.includes("Subagent A"))?.sessionPath;
+					const subAFollowUpPath = seen.at(-1)?.sessionPath;
+					assert.equal(subAFollowUpPath, subAInitialPath, "Follow-up turn must keep the same trajectory sessionPath");
+				},
+			);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
