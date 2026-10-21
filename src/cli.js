@@ -20,6 +20,7 @@ import {
 	removeAccount,
 	resetAccountQuota,
 	rotateToNextAvailableAccount,
+	setAccountModelAccess,
 	switchActiveAccount,
 	upsertAccount,
 	withQuotaRotation,
@@ -53,6 +54,7 @@ Usage:
   node src/cli.js accounts rotate
   node src/cli.js accounts reset-quota [email]
   node src/cli.js accounts remove <email>
+  node src/cli.js accounts argon <email> allow|deny|clear
   node src/cli.js keys [list] [--json]
   node src/cli.js keys add [--name text] [--key value]
   node src/cli.js keys edit <key_or_name> [--name text] [--enable | --disable]
@@ -75,13 +77,18 @@ accounts lists and manages your Gmail accounts. When multiple accounts are
 signed in, serve automatically rotates to the next available account if one hits
 its 5-hour or weekly quota limit.
 
+accounts argon marks whether a Gmail account can call gemini-4-argon.
+deny accounts are skipped. Once any account is marked allow, Argon calls use
+only those accounts. A 404 on Argon marks that account deny and rotates on.
+
 keys manages client API keys and tracks request counts and token consumption per key.
 
 models lists the logical models for the signed-in account. generate sends the
 prompt to the selected model. The default model is ${DEFAULT_MODEL_ID}.
 --effort selects the thinking tier and the upstream wire id.
 
-serve listens for POST /v1/chat/completions and GET /v1/models. Every call uses ${SERVER_MODEL_ID}.
+serve listens for POST /v1/chat/completions and GET /v1/models. The default model
+is ${SERVER_MODEL_ID}. Send "model": "gemini-4-argon" to call Gemini 4 Argon.
 effort defaults to ${DEFAULT_SERVER_EFFORT}. Send the API key as
 Authorization: Bearer <key>, x-api-key, or JSON apiKey. Prompts, messages,
 and tools are forwarded. The key is --api-key, else ANTIGRAVITY_API_KEY, else
@@ -111,6 +118,8 @@ function parseArgs(argv) {
 	};
 	const rest = argv.slice(2);
 	if (rest[0] && !rest[0].startsWith("-")) args.command = rest.shift() ?? "login";
+	if (args.command === "account") args.command = "accounts";
+	if (args.command === "key" || args.command === "api-key") args.command = "keys";
 	const take = (flag, index) => {
 		const value = rest[index + 1];
 		if (value === undefined || value.startsWith("--")) throw new Error(`Missing value for ${flag}`);
@@ -210,6 +219,19 @@ function promptForCode(signal) {
  * @param {{ email?: string, projectId?: string, expires?: number }} credential
  * @param {string} file
  */
+function rotationLine(info, automatic) {
+	const from = info.from ?? "unknown";
+	const to = info.to ?? "unknown";
+	if (info.reason === "model-access") {
+		return `[Argon] Account ${from} cannot call gemini-4-argon. Rotated to ${to}`;
+	}
+	if (info.reason === "model-skip") {
+		return `[Argon] Account ${from} is not marked allow for gemini-4-argon. Using ${to}`;
+	}
+	const quota = automatic ? "Automatically rotated" : "Rotated";
+	return `[Auto-Quota] Account ${from} exceeded quota. ${quota} to ${to}`;
+}
+
 function printIdentity(credential, file) {
 	const who = credential.email ? ` as ${credential.email}` : "";
 	process.stdout.write(`Logged in to Antigravity${who}\n`);
@@ -270,6 +292,7 @@ async function main() {
 				process.stdout.write(`${marker}${acc.email}${activeTag}\n`);
 				if (acc.projectId) process.stdout.write(`       Project: ${acc.projectId}\n`);
 				process.stdout.write(`       Quota:   ${quotaTag}${acc.lastQuotaExhausted ? ` (since ${new Date(acc.lastQuotaExhausted).toLocaleTimeString()})` : ""}\n`);
+				process.stdout.write(`       Argon:   ${acc.argon}\n`);
 				process.stdout.write(`       Token:   ${expiryTag}\n`);
 				if (acc.file) process.stdout.write(`       File:    ${acc.file}\n`);
 			}
@@ -314,7 +337,17 @@ async function main() {
 			return;
 		}
 
-		throw new Error(`Unknown accounts action "${action}". Use list, use, rotate, reset-quota, or remove.`);
+		if (action === "argon") {
+			const access = args.positionals[2];
+			if (!targetEmail || !access) {
+				throw new Error("Usage: node src/cli.js accounts argon <email> allow|deny|clear");
+			}
+			const updated = setAccountModelAccess(targetEmail, "argon", access);
+			process.stdout.write(`${updated.email}: ${updated.model} ${updated.access}\n`);
+			return;
+		}
+
+		throw new Error(`Unknown accounts action "${action}". Use list, use, rotate, reset-quota, remove, or argon.`);
 	}
 
 	if (args.command === "keys" || args.command === "api-keys") {
@@ -422,7 +455,7 @@ async function main() {
 				process.stdout.write(`${new Date().toISOString()} ${line}\n`);
 			},
 			onRotate(info) {
-				process.stdout.write(`[Auto-Quota] Account ${info.from} exceeded quota. Automatically rotated to ${info.to}\n`);
+				process.stdout.write(`${rotationLine(info, true)}\n`);
 			},
 		});
 		const address = await listen(server, { host, port });
@@ -484,8 +517,9 @@ async function main() {
 			credentialPath: file,
 			sessionPath,
 			canRotate: () => !outputStarted,
+			model: args.model,
 			onRotate(info) {
-				process.stderr.write(`[Auto-Quota] Account ${info.from ?? "unknown"} exceeded quota. Rotated to ${info.to}\n`);
+				process.stderr.write(`${rotationLine(info, false)}\n`);
 			},
 			run(currentCredential) {
 				return generateAntigravity({

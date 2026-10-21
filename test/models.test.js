@@ -8,6 +8,7 @@ import {
 	mapEffortToGoogleThinkingLevel,
 	modelsFromDiscoveryPayload,
 	catalogAntigravityModel,
+	GEMINI_4_ARGON_ID,
 	resolveThinking,
 	resolveWireModelId,
 	selectModel,
@@ -55,6 +56,33 @@ describe("Antigravity catalog model", () => {
 		assert.equal(resolveWireModelId(model, "medium"), "gemini-3.8-flash-medium");
 		assert.equal(model.compat.flashStreamLeakWorkaround, true);
 		assert.equal(model.compat.streamFirstEventTimeoutMs, 300_000);
+		assert.equal(model.contextWindow, 1_048_576);
+		assert.equal(model.maxTokens, 65_536);
+	});
+
+	it("routes gemini-4-argon by thinking level without discovery", () => {
+		const model = catalogAntigravityModel(GEMINI_4_ARGON_ID);
+		assert.equal(model.id, "gemini-4-argon");
+		assert.equal(model.name, "Gemini 4 Argon");
+		assert.equal(model.thinking.mode, "google-level");
+		assert.equal(model.thinking.requiresEffort, true);
+		assert.deepEqual(model.thinking.efforts, ["low", "medium", "high"]);
+		assert.equal(model.requestModelId, "gemini-4-argon-low");
+		assert.equal(model.contextWindow, 1_048_576);
+		assert.equal(model.maxTokens, 65_536);
+
+		const off = resolveThinking(model, { effort: "off" });
+		assert.equal(off.effort, "low");
+		assert.equal(off.wireModelId, "gemini-4-argon-low");
+		assert.equal(off.thinking.level, "LOW");
+
+		const medium = resolveThinking(model, { effort: "medium" });
+		assert.equal(medium.wireModelId, "gemini-4-argon-medium");
+		assert.equal(medium.thinking.level, "MEDIUM");
+
+		const high = resolveThinking(model, { effort: "high" });
+		assert.equal(high.wireModelId, "gemini-4-argon-high");
+		assert.equal(high.thinking.level, "HIGH");
 	});
 });
 
@@ -162,6 +190,50 @@ describe("Antigravity model discovery", () => {
 			return new Response("no", { status: 401 });
 		};
 		assert.equal(await fetchAntigravityDiscovery({ token: "access-token", fetch: fetchImpl }), null);
+	});
+
+	it("collapses gemini-4-argon thinking SKUs into one model", () => {
+		const listed = modelsFromDiscoveryPayload(
+			{
+				models: {
+					"gemini-4-argon": { displayName: "Gemini 4 Argon", supportsThinking: true, supportsImages: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+					"gemini-4-argon-low": { displayName: "Gemini 4 Argon (Low)", supportsThinking: true, supportsImages: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+					"gemini-4-argon-medium": { displayName: "Gemini 4 Argon (Medium)", supportsThinking: true, supportsImages: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+					"gemini-4-argon-high": { displayName: "Gemini 4 Argon (High)", supportsThinking: true, supportsImages: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+				},
+			},
+			ANTIGRAVITY_DAILY_ENDPOINT,
+		);
+		assert.deepEqual(listed.models.map((model) => model.id), ["gemini-4-argon"]);
+		const argon = selectModel(listed.models, "gemini-4-argon").model;
+		assert.equal(argon.contextWindow, 1048576);
+		assert.equal(argon.maxTokens, 65536);
+		assert.equal(argon.thinking.effortRouting.low, "gemini-4-argon-low");
+		assert.equal(argon.thinking.effortRouting.medium, "gemini-4-argon-medium");
+		assert.equal(argon.thinking.effortRouting.high, "gemini-4-argon-high");
+		assert.equal(argon.input.includes("image"), true);
+		const picked = selectModel(listed.models, "gemini-4-argon-high");
+		assert.equal(picked.model.id, "gemini-4-argon");
+		assert.equal(picked.effort, "high");
+	});
+
+	it("keeps gemini-4-argon when discovery only advertises the medium SKU", () => {
+		const listed = modelsFromDiscoveryPayload(
+			{
+				models: {
+					"gemini-4-argon-medium": { displayName: "Gemini 4 Argon (Medium)", supportsThinking: true, maxTokens: 1048576, maxOutputTokens: 65536 },
+				},
+			},
+			ANTIGRAVITY_DAILY_ENDPOINT,
+		);
+		const argon = selectModel(listed.models, "gemini-4-argon").model;
+		assert.equal(argon.requestModelId, "gemini-4-argon-medium");
+		assert.equal(argon.thinking.effortRouting.medium, "gemini-4-argon-medium");
+		assert.equal(argon.thinking.effortRouting.low, undefined);
+		const medium = resolveThinking(argon, {});
+		assert.equal(medium.effort, "medium");
+		assert.equal(medium.wireModelId, "gemini-4-argon-medium");
+		assert.equal(medium.thinking.level, "MEDIUM");
 	});
 
 	it("leaves an already-logical id untouched when no sibling wire ids are present", () => {

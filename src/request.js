@@ -76,7 +76,7 @@ export function randomSignedDecimalSessionId(bytes) {
 /**
  * @param {string | undefined} signature
  */
-function isValidThoughtSignature(signature) {
+export function isValidThoughtSignature(signature) {
 	if (!signature) return false;
 	if (signature.length % 4 !== 0) return false;
 	return SIGNATURE_PATTERN.test(signature);
@@ -309,8 +309,9 @@ function asBlocks(content) {
 /**
  * @param {object} model
  * @param {Array<object>} messages
+ * @param {{ wireModelId?: string, toolSignatures?: Record<string, { signature?: string, wireModelId?: string }> }} [options]
  */
-export function convertMessages(model, messages) {
+export function convertMessages(model, messages, options = {}) {
 	/** @type {Array<{ role: string, parts: object[] }>} */
 	const contents = [];
 	/** @type {Map<string, string>} */
@@ -354,7 +355,9 @@ export function convertMessages(model, messages) {
 			const parts = [];
 			const sameModel = message.provider === model.provider && message.model === model.id;
 			const dropUnsigned = model.compat?.dropUnsignedThinking === true;
-			let isFirstToolCall = true;
+			const needsSentinel =
+				model.compat?.requiresSkipThoughtSignature === true ||
+				model.compat?.requiresSkipThoughtSignatureOnFirstFunctionCall === true;
 			const blocks = typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content ?? [];
 			for (const block of blocks) {
 				if (block.type === "text") {
@@ -375,16 +378,24 @@ export function convertMessages(model, messages) {
 						parts.push({ text: `<think>\n${wellFormed(block.thinking)}\n</think>` });
 					}
 				} else if (block.type === "toolCall") {
-					const id = normalizeToolCallId(String(block.id ?? nextToolCallId(block.name || "tool")));
+					const rawId = block.id == null ? "" : String(block.id);
+					const id = normalizeToolCallId(rawId || nextToolCallId(block.name || "tool"));
 					emittedToolCallNames.set(block.id, block.name);
 					emittedToolCallNames.set(id, block.name);
-					const signature =
-						sameModel && isValidThoughtSignature(block.thoughtSignature) ? block.thoughtSignature : undefined;
-					const requiresFallback =
-						model.compat?.requiresSkipThoughtSignature === true ||
-						(isFirstToolCall && model.compat?.requiresSkipThoughtSignatureOnFirstFunctionCall === true);
-					const effective = signature || (requiresFallback ? SKIP_THOUGHT_SIGNATURE : undefined);
-					isFirstToolCall = false;
+					const stored = options.toolSignatures?.[id] ?? (rawId && rawId !== id ? options.toolSignatures?.[rawId] : undefined);
+					const storedOtherWire = Boolean(
+						stored?.wireModelId && options.wireModelId && stored.wireModelId !== options.wireModelId,
+					);
+					const storedSignature =
+						stored &&
+						!storedOtherWire &&
+						(!options.wireModelId || stored.wireModelId === options.wireModelId) &&
+						isValidThoughtSignature(stored.signature)
+							? stored.signature
+							: undefined;
+					const onBlock = isValidThoughtSignature(block.thoughtSignature) ? block.thoughtSignature : undefined;
+					const blockSignature = onBlock && (sameModel || !storedOtherWire) ? onBlock : undefined;
+					const effective = storedSignature || blockSignature || (needsSentinel ? SKIP_THOUGHT_SIGNATURE : undefined);
 					/** @type {Record<string, unknown>} */
 					const part = {
 						functionCall: {
@@ -567,7 +578,10 @@ export function buildAntigravityRequestEnvelope(model, messages, wireModelId, st
  */
 export function buildAntigravityRequest(model, context, projectId, state, ids) {
 	const resolved = resolveThinking(model, context);
-	const contents = convertMessages(model, context.messages ?? []);
+	const contents = convertMessages(model, context.messages ?? [], {
+		wireModelId: resolved.wireModelId,
+		toolSignatures: state?.toolSignatures,
+	});
 	/** @type {Record<string, unknown>} */
 	const generationConfig = {};
 	if (context.temperature !== undefined) generationConfig.temperature = context.temperature;

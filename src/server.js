@@ -16,6 +16,7 @@ import {
 	SERVER_MODEL_ID,
 	SERVER_MODEL_IDS,
 	formatChatChunk,
+	formatOpenAiToolCall,
 	formatUsage,
 	formatChatCompletion,
 	formatModelObject,
@@ -256,14 +257,7 @@ export function createChatServer(options) {
 					formatChatChunk(
 						streamId,
 						{
-							tool_calls: [
-								{
-									index: toolIndex,
-									id: call.id,
-									type: "function",
-									function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
-								},
-							],
+							tool_calls: [formatOpenAiToolCall({ ...call, index: toolIndex })],
 						},
 						null,
 						chat.model,

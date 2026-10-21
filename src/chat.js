@@ -1,12 +1,15 @@
 /**
  * Map an HTTP chat request onto generateAntigravity.
- * The server model is always gemini-3.8-flash. Effort defaults to medium.
+ * The default server model is gemini-3.8-flash. gemini-4-argon is selected
+ * when the request names it. Effort defaults to medium.
  * OpenAI chat-completions bodies and the native message shape are both accepted.
  */
 import crypto from "node:crypto";
+import { GEMINI_4_ARGON_ID } from "./models.js";
+import { isValidThoughtSignature } from "./request.js";
 
 export const SERVER_MODEL_ID = "gemini-3.8-flash";
-export const SERVER_MODEL_IDS = Object.freeze(["gemini-3.8-flash", "gemini-4-argon"]);
+export const SERVER_MODEL_IDS = Object.freeze([SERVER_MODEL_ID, GEMINI_4_ARGON_ID]);
 export const DEFAULT_SERVER_EFFORT = "medium";
 
 const EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -96,6 +99,13 @@ function mapUserContent(content) {
 /**
  * @param {object} call
  */
+function thoughtSignatureFromOpenAiCall(call) {
+	const fn = call.function ?? {};
+	const google = call.extra_content?.google ?? fn.extra_content?.google ?? {};
+	const signature = call.thoughtSignature ?? fn.thoughtSignature ?? google.thought_signature ?? google.thoughtSignature;
+	return isValidThoughtSignature(signature) ? signature : undefined;
+}
+
 function mapOpenAiToolCall(call) {
 	const fn = call.function ?? call;
 	let args = fn.arguments ?? call.arguments ?? {};
@@ -106,7 +116,29 @@ function mapOpenAiToolCall(call) {
 			args = {};
 		}
 	}
-	return { type: "toolCall", id: call.id, name: fn.name ?? call.name ?? "", arguments: args };
+	const signature = thoughtSignatureFromOpenAiCall(call);
+	return {
+		type: "toolCall",
+		id: call.id,
+		name: fn.name ?? call.name ?? "",
+		arguments: args,
+		...(signature ? { thoughtSignature: signature } : {}),
+	};
+}
+
+export function formatOpenAiToolCall(call) {
+	const signature = isValidThoughtSignature(call.thoughtSignature) ? call.thoughtSignature : undefined;
+	const args = call.arguments;
+	return {
+		...(call.index !== undefined ? { index: call.index } : {}),
+		id: call.id,
+		type: "function",
+		function: {
+			name: call.name,
+			arguments: typeof args === "string" ? args : JSON.stringify(args ?? {}),
+		},
+		...(signature ? { extra_content: { google: { thought_signature: signature } } } : {}),
+	};
 }
 
 /**
@@ -192,12 +224,15 @@ function optionalNumber(value, label) {
 
 /**
  * Turn a chat request into generateAntigravity options.
- * The model id is forced. apiKey is not copied through.
+ * gemini-4-argon is kept. Any other model id uses gemini-3.8-flash.
+ * apiKey is not copied through.
  * @param {Record<string, unknown>} body
  */
 export function normalizeChatRequest(body) {
 	if (!body || typeof body !== "object" || Array.isArray(body)) throw new ChatRequestError("Request body must be a JSON object");
 	const effort = assertEffort(body.effort ?? body.reasoning_effort);
+	const requestedModel = typeof body.model === "string" ? body.model.trim() : "";
+	const model = requestedModel === GEMINI_4_ARGON_ID ? GEMINI_4_ARGON_ID : SERVER_MODEL_ID;
 	/** @type {string[]} */
 	const systemParts = [];
 	const directSystem = body.systemPrompt ?? body.system;
@@ -219,7 +254,6 @@ export function normalizeChatRequest(body) {
 	if (messages.length === 0 && !prompt) throw new ChatRequestError("Pass messages or a prompt");
 	const maxTokens = optionalNumber(body.maxTokens ?? body.max_tokens, "max_tokens");
 	if (maxTokens !== undefined && maxTokens <= 0) throw new ChatRequestError("Invalid max_tokens");
-	const model = typeof body?.model === "string" && SERVER_MODEL_IDS.includes(body.model) ? body.model : SERVER_MODEL_ID;
 	return {
 		model,
 		effort,
@@ -253,74 +287,13 @@ export function normalizeChatRequest(body) {
  *   responseId?: string,
  * }} result
  */
-/**
- * @param {{
- *   input?: number,
- *   output?: number,
- *   totalTokens?: number,
- *   cacheRead?: number,
- *   reasoningTokens?: number,
- *   raw?: Record<string, any>,
- * } | undefined} usage
- */
-export function formatUsage(usage) {
-	const cachedTokens = usage?.cacheRead ?? usage?.raw?.cachedContentTokenCount ?? 0;
-	const promptTokens = usage?.raw?.promptTokenCount ?? ((usage?.input ?? 0) + cachedTokens);
-	const promptCacheMissTokens = usage?.input ?? Math.max(0, promptTokens - cachedTokens);
-	const completionTokens = usage?.output ?? 0;
-	const totalTokens = usage?.totalTokens ?? (promptTokens + completionTokens);
-	const reasoningTokens = usage?.reasoningTokens ?? 0;
-
-	/** @type {Record<string, any>} */
-	const formatted = {
-		prompt_tokens: promptTokens,
-		completion_tokens: completionTokens,
-		total_tokens: totalTokens,
-	};
-	if (cachedTokens > 0 || usage?.cacheRead !== undefined || usage?.raw?.cachedContentTokenCount !== undefined) {
-		formatted.prompt_tokens_details = { cached_tokens: cachedTokens };
-		formatted.prompt_cache_hit_tokens = cachedTokens;
-		formatted.prompt_cache_miss_tokens = promptCacheMissTokens;
-	}
-	if (reasoningTokens > 0 || usage?.reasoningTokens !== undefined) {
-		formatted.completion_tokens_details = { reasoning_tokens: reasoningTokens };
-	}
-	if (usage?.raw?.trafficType !== undefined) {
-		formatted.trafficType = usage.raw.trafficType;
-	}
-	if (usage?.raw !== undefined) {
-		formatted.usageMetadata = usage.raw;
-	}
-	return formatted;
-}
-
-/**
- * @param {{
- *   text?: string,
- *   thinking?: string,
- *   toolCalls?: object[],
- *   stopReason?: string,
- *   usage?: { input?: number, output?: number, totalTokens?: number },
- *   effort?: string,
- *   wireModelId?: string,
- *   responseId?: string,
- *   model?: string,
- * }} result
- */
 export function formatChatCompletion(result) {
-	const toolCalls = (result.toolCalls ?? []).map((call) => ({
-		id: call.id,
-		type: "function",
-		function: {
-			name: call.name,
-			arguments: JSON.stringify(call.arguments ?? {}),
-		},
-	}));
+	const toolCalls = (result.toolCalls ?? []).map((call) => formatOpenAiToolCall(call));
 	const finishReason = result.stopReason === "length" ? "length" : toolCalls.length > 0 ? "tool_calls" : "stop";
 	return {
 		id: result.responseId ? `chatcmpl-${result.responseId}` : `chatcmpl-${crypto.randomUUID()}`,
 		object: "chat.completion",
-		model: result.model ?? SERVER_MODEL_ID,
+		model: result.model || SERVER_MODEL_ID,
 		effort: result.effort ?? DEFAULT_SERVER_EFFORT,
 		wireModelId: result.wireModelId,
 		choices: [
@@ -343,10 +316,34 @@ export function formatChatCompletion(result) {
 }
 
 /**
+ * OpenAI usage. `prompt_tokens` includes cached input. `completion_tokens`
+ * includes reasoning. The detail fields are the subsets, not extras.
+ * @param {{ input?: number, output?: number, totalTokens?: number, cacheRead?: number, reasoningTokens?: number }} [usage]
+ */
+export function formatUsage(usage = {}) {
+	const raw = usage.raw && typeof usage.raw === "object" && !Array.isArray(usage.raw) ? usage.raw : undefined;
+	const cacheRead = usage.cacheRead ?? 0;
+	const input = usage.input ?? 0;
+	const reasoning = usage.reasoningTokens ?? 0;
+	const completion = usage.output ?? 0;
+	const prompt = input + cacheRead;
+	return {
+		...(raw ?? {}),
+		prompt_tokens: prompt,
+		completion_tokens: completion,
+		total_tokens: usage.totalTokens ?? prompt + completion,
+		prompt_tokens_details: { cached_tokens: cacheRead },
+		completion_tokens_details: { reasoning_tokens: reasoning },
+		prompt_cache_hit_tokens: cacheRead,
+		prompt_cache_miss_tokens: input,
+		...(raw ? { usageMetadata: raw } : {}),
+	};
+}
+
+/**
  * @param {string} id
  * @param {Record<string, unknown>} delta
  * @param {string | null} finishReason
- * @param {string} [model]
  */
 export function formatChatChunk(id, delta, finishReason, model = SERVER_MODEL_ID) {
 	return {
@@ -371,6 +368,7 @@ export function formatModelObject(id = SERVER_MODEL_ID) {
 
 /**
  * Format the models list response in OpenAI format.
+ * gemini-3.8-flash is the default. gemini-4-argon is the other served model.
  */
 export function formatModelsList() {
 	return {

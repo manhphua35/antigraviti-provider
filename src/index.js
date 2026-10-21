@@ -19,6 +19,10 @@ export {
 	resetAccountQuota,
 	rotateToNextAvailableAccount,
 	withQuotaRotation,
+	gatedModelFamily,
+	accountModelAccess,
+	setAccountModelAccess,
+	isModelAccessError,
 } from "./accounts.js";
 export { openBrowser, browserCommand } from "./open-browser.js";
 export { OAuthError, LoginCancelledError, AntigravityApiError } from "./errors.js";
@@ -33,6 +37,7 @@ export {
 	chooseModel,
 	mapEffortToGoogleThinkingLevel,
 	DEFAULT_MODEL_ID,
+	GEMINI_4_ARGON_ID,
 } from "./models.js";
 export { buildAntigravityRequest, deriveSignedDecimalFromHash } from "./request.js";
 export { listAntigravityModels, generateAntigravity, selectAntigravityEndpoints } from "./generate.js";
@@ -59,7 +64,6 @@ export {
 	DEFAULT_SERVER_EFFORT,
 	normalizeChatRequest,
 	formatChatCompletion,
-	formatUsage,
 	formatModelsList,
 	formatModelObject,
 	readRequestApiKey,

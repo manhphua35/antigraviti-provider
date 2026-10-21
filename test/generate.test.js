@@ -103,8 +103,54 @@ describe("Antigravity generate", () => {
 		assert.equal(result.stopReason, "stop");
 		assert.equal(result.usage.input, 10);
 		assert.equal(result.usage.output, 2);
+		assert.equal(result.usage.cacheRead, 0);
 		assert.equal(result.endpoint, ANTIGRAVITY_DAILY_ENDPOINT);
 		assert.equal(calls.some((call) => call.href.includes("streamGenerateContent")), true);
+	});
+
+	it("keeps a cache hit reported in snake_case when a later chunk omits it", async () => {
+		const fetchImpl = async (url) => {
+			if (String(url).includes("manifest")) return new Response("version: 2.8.0\n");
+			return sse([
+				{
+					response: {
+						candidates: [{ content: { role: "model", parts: [{ text: "a" }] } }],
+						usage_metadata: {
+							prompt_token_count: 100,
+							cached_content_token_count: 80,
+							candidates_token_count: 1,
+							total_token_count: 101,
+							trafficType: "ON_DEMAND",
+							promptTokensDetails: [{ modality: "TEXT", tokenCount: 100 }],
+						},
+					},
+				},
+				{
+					response: {
+						candidates: [{ content: { role: "model", parts: [{ text: "b" }] }, finishReason: "STOP" }],
+						usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 2, totalTokenCount: 102 },
+					},
+				},
+			]);
+		};
+		const result = await generateAntigravity({
+			credential: credential(),
+			models: models(),
+			model: "gemini-3.1-pro",
+			prompt: "Hi",
+			fetch: fetchImpl,
+			sleep: async () => {
+				throw new Error("should not retry");
+			},
+		});
+		assert.equal(result.text, "ab");
+		assert.equal(result.usage.cacheRead, 80);
+		assert.equal(result.usage.input, 20);
+		assert.equal(result.usage.output, 2);
+		assert.equal(result.usage.raw.trafficType, "ON_DEMAND");
+		assert.equal(result.usage.raw.cached_content_token_count, 80);
+		assert.equal(result.usage.raw.promptTokensDetails[0].tokenCount, 100);
+		assert.equal(result.usage.raw.candidatesTokenCount, 2);
 	});
 
 	it("calls gemini-3.8-flash like omp, without listing models, and continues the session", async () => {
@@ -156,6 +202,84 @@ describe("Antigravity generate", () => {
 		assert.equal(bodies[1].request.labels.last_execution_id, "resp-1");
 		assert.equal(bodies[1].request.sessionId, bodies[0].request.sessionId);
 		assert.equal(loadSession(sessionPath).stepIndex, 3);
+	});
+
+	it("stores a tool-call signature and sends it back with the same wire model", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "antigravity-sig-"));
+		const sessionPath = path.join(dir, "session.json");
+		/** @type {object[]} */
+		const bodies = [];
+		const fetchImpl = async (url, init) => {
+			const href = String(url);
+			if (href.includes("manifest")) return new Response("version: 2.8.0\n");
+			bodies.push(JSON.parse(init.body));
+			if (bodies.length === 1) {
+				return sse([
+					{
+						response: {
+							candidates: [
+								{
+									content: {
+										role: "model",
+										parts: [
+											{
+												functionCall: { id: "call_1", name: "lookup", args: { q: "x" } },
+												thoughtSignature: "AQIDBA==",
+											},
+										],
+									},
+									finishReason: "STOP",
+									responseId: "resp-1",
+								},
+							],
+						},
+					},
+				]);
+			}
+			return sse([textEvent("done", { responseId: "resp-2" })]);
+		};
+		const model = catalogAntigravityModel("gemini-3.1-pro");
+		await generateAntigravity({
+			credential: credential(),
+			models: [model],
+			model: "gemini-3.1-pro",
+			effort: "high",
+			prompt: "Hello",
+			fetch: fetchImpl,
+			sessionPath,
+			sleep: async () => {
+				throw new Error("should not retry");
+			},
+		});
+		assert.equal(loadSession(sessionPath).toolSignatures.call_1.signature, "AQIDBA==");
+		assert.equal(loadSession(sessionPath).toolSignatures.call_1.wireModelId, "gemini-pro-agent");
+		await generateAntigravity({
+			credential: credential(),
+			models: [model],
+			model: "gemini-3.1-pro",
+			effort: "high",
+			messages: [
+				{ role: "user", content: "Hello" },
+				{
+					role: "assistant",
+					content: [
+						{ type: "toolCall", id: "call_1", name: "lookup", arguments: { q: "x" } },
+						{ type: "toolCall", id: "call_2", name: "other", arguments: {} },
+					],
+				},
+				{ role: "user", content: "Again" },
+			],
+			fetch: fetchImpl,
+			sessionPath,
+			sleep: async () => {
+				throw new Error("should not retry");
+			},
+		});
+		const parts = bodies[1].request.contents.find((entry) => entry.role === "model").parts;
+		assert.equal(parts[0].functionCall.id, "call_1");
+		assert.equal(parts[0].thoughtSignature, "AQIDBA==");
+		assert.equal(parts[1].functionCall.id, "call_2");
+		assert.equal(parts[1].thoughtSignature, "skip_thought_signature_validator");
 	});
 
 	it("fails over from a transient daily response to sandbox and remembers it", async () => {

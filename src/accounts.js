@@ -8,6 +8,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { AntigravityApiError } from "./errors.js";
+import { GEMINI_4_ARGON_ID } from "./models.js";
 import { saveSession } from "./session.js";
 import { defaultCredentialPath, loadCredentials, saveCredentials, writeJsonAtomic } from "./store.js";
 
@@ -75,12 +77,15 @@ function collapseAccountKeys(accounts) {
 		const exhausted = [primary, secondary]
 			.filter((item) => item.quotaStatus === "exhausted")
 			.sort((a, b) => (b.lastQuotaExhausted ?? 0) - (a.lastQuotaExhausted ?? 0))[0];
+		const modelAccess = mergeModelAccess(primary.modelAccess, secondary.modelAccess);
 		collapsed[key] = {
 			...primary,
 			email: key,
 			quotaStatus: exhausted ? "exhausted" : (primary.quotaStatus ?? "ok"),
 			lastQuotaExhausted: exhausted?.lastQuotaExhausted ?? null,
 		};
+		if (modelAccess) collapsed[key].modelAccess = modelAccess;
+		else delete collapsed[key].modelAccess;
 	}
 	return { accounts: changed ? collapsed : accounts, changed };
 }
@@ -261,15 +266,17 @@ export function upsertAccount(credential, options = {}) {
 	saveCredentials(storedCredential, targetFile);
 
 	// Update record in index
+	const previous = index.accounts[email];
 	index.accounts[email] = {
 		email,
 		projectId: storedCredential.projectId,
 		file: targetFile,
 		expires: storedCredential.expires,
-		quotaStatus: index.accounts[email]?.quotaStatus ?? "ok",
-		lastQuotaExhausted: index.accounts[email]?.lastQuotaExhausted ?? null,
+		quotaStatus: previous?.quotaStatus ?? "ok",
+		lastQuotaExhausted: previous?.lastQuotaExhausted ?? null,
 		updatedAt: Date.now(),
 	};
+	if (previous?.modelAccess) index.accounts[email].modelAccess = previous.modelAccess;
 
 	if (setActive) {
 		index.active = email;
@@ -325,6 +332,7 @@ export function listAccounts(options = {}) {
 			isActive,
 			isExpired,
 			quotaStatus: isExhausted ? "exhausted" : "ok",
+			argon: accountModelAccess(account, GEMINI_4_ARGON_ID),
 		};
 	});
 }
@@ -427,6 +435,135 @@ export function removeAccount(email, options = {}) {
  * @param {unknown} error
  * @returns {boolean}
  */
+/**
+ * Logical family for a model whose calls are limited to marked accounts.
+ * Wire ids such as gemini-4-argon-medium use the same mark as gemini-4-argon.
+ * @param {unknown} modelId
+ * @returns {string | null}
+ */
+export function gatedModelFamily(modelId) {
+	const id = String(modelId ?? "").trim().toLowerCase();
+	if (!id) return null;
+	if (id === GEMINI_4_ARGON_ID || id.startsWith(`${GEMINI_4_ARGON_ID}-`)) return GEMINI_4_ARGON_ID;
+	return null;
+}
+
+/**
+ * @param {object | undefined} account
+ * @param {unknown} modelId
+ * @returns {"allow" | "deny" | "unknown"}
+ */
+export function accountModelAccess(account, modelId) {
+	const family = gatedModelFamily(modelId);
+	if (!family) return "unknown";
+	const value = account?.modelAccess?.[family];
+	if (value === "allow" || value === "deny") return value;
+	return "unknown";
+}
+
+/**
+ * @param {unknown} value
+ * @returns {"allow" | "deny" | "clear"}
+ */
+function normalizeAccessVerb(value) {
+	const verb = String(value ?? "").trim().toLowerCase();
+	if (verb === "allow" || verb === "yes" || verb === "on") return "allow";
+	if (verb === "deny" || verb === "no" || verb === "off") return "deny";
+	if (verb === "clear" || verb === "unknown" || verb === "reset") return "clear";
+	throw new Error(`Invalid model access "${value}". Use allow, deny, or clear.`);
+}
+
+/**
+ * @param {unknown} primary
+ * @param {unknown} secondary
+ */
+function mergeModelAccess(primary, secondary) {
+	const left = primary && typeof primary === "object" ? primary : {};
+	const right = secondary && typeof secondary === "object" ? secondary : {};
+	/** @type {Record<string, string>} */
+	const merged = {};
+	for (const [key, value] of Object.entries({ ...right, ...left })) {
+		if (value === "allow" || value === "deny") merged[key] = value;
+	}
+	return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/**
+ * @param {object | undefined} account
+ * @param {string} family
+ * @param {boolean} allowOnly
+ */
+function accountMayCall(account, family, allowOnly) {
+	const access = account?.modelAccess?.[family];
+	if (access === "deny") return false;
+	if (access === "allow") return true;
+	return !allowOnly;
+}
+
+/**
+ * @param {{ accounts: Record<string, any> }} index
+ * @param {string} family
+ */
+function indexAllowsModel(index, family) {
+	return Object.values(index.accounts).some((account) => account?.modelAccess?.[family] === "allow");
+}
+
+/**
+ * Mark whether an account can call a gated model. `clear` removes the mark.
+ * @param {string} email
+ * @param {string} modelId
+ * @param {"allow" | "deny" | "clear" | string} access
+ * @param {{
+ *   indexPath?: string,
+ *   accountsDir?: string,
+ *   credentialPath?: string,
+ * }} [options]
+ */
+export function setAccountModelAccess(email, modelId, access, options = {}) {
+	const family = gatedModelFamily(modelId) ?? (String(modelId ?? "").trim().toLowerCase() === "argon" ? GEMINI_4_ARGON_ID : null);
+	if (!family) throw new Error(`Unknown model "${modelId}". Use ${GEMINI_4_ARGON_ID}.`);
+	const verb = normalizeAccessVerb(access);
+	const index = loadAccountsIndex(options);
+	const targetEmail = Object.keys(index.accounts).find((key) => key.toLowerCase() === String(email).toLowerCase());
+	if (!targetEmail || !index.accounts[targetEmail]) {
+		throw new Error(`Account "${email}" not found.`);
+	}
+	const account = index.accounts[targetEmail];
+	account.modelAccess = account.modelAccess && typeof account.modelAccess === "object" ? { ...account.modelAccess } : {};
+	if (verb === "clear") delete account.modelAccess[family];
+	else account.modelAccess[family] = verb;
+	if (Object.keys(account.modelAccess).length === 0) delete account.modelAccess;
+	saveAccountsIndex(index, options.indexPath ?? defaultAccountsIndexPath());
+	return {
+		email: targetEmail,
+		model: family,
+		access: accountModelAccess(account, family),
+	};
+}
+
+/**
+ * Cloud Code Assist answers an account that cannot call Argon with 404 NOT_FOUND.
+ * @param {unknown} error
+ */
+export function isModelAccessError(error) {
+	if (!error) return false;
+	const status = typeof error === "object" && error !== null && "status" in error ? /** @type {any} */ (error).status : undefined;
+	if (status === 404) return true;
+	const msg = String(error instanceof Error ? error.message : error).toLowerCase();
+	return msg.includes("not_found") || msg.includes("requested entity was not found");
+}
+
+/**
+ * @param {string} model
+ */
+function noEligibleAccountError(model) {
+	const family = gatedModelFamily(model) ?? model;
+	return new AntigravityApiError(
+		`No account can call ${family}. Mark one with: node src/cli.js accounts argon <email> allow`,
+		{ status: 403, kind: "model-access" },
+	);
+}
+
 export function isQuotaError(error) {
 	if (!error) return false;
 	const status = typeof error === "object" && error !== null && "status" in error ? /** @type {any} */ (error).status : undefined;
@@ -508,6 +645,8 @@ export function resetAccountQuota(email, options = {}) {
  *   indexPath?: string,
  *   accountsDir?: string,
  *   credentialPath?: string,
+ *   model?: string,
+ *   now?: number,
  * }} [options]
  * @returns {{
  *   rotated: boolean,
@@ -523,9 +662,13 @@ export function rotateToNextAvailableAccount(currentEmail, options = {}) {
 		return { rotated: false, previousEmail: currentEmail ?? null };
 	}
 
-	const candidates = accounts.filter(
-		(a) => !currentEmail || a.email.toLowerCase() !== currentEmail.toLowerCase(),
-	);
+	const family = gatedModelFamily(options.model);
+	const allowOnly = family ? indexAllowsModel(index, family) : false;
+	const candidates = accounts.filter((account) => {
+		if (currentEmail && account.email.toLowerCase() === String(currentEmail).toLowerCase()) return false;
+		if (family && !accountMayCall(account, family, allowOnly)) return false;
+		return true;
+	});
 	if (candidates.length === 0) {
 		return { rotated: false, previousEmail: currentEmail ?? null };
 	}
@@ -576,37 +719,68 @@ function accountLocations(options) {
  *   accountsDir?: string,
  *   indexPath?: string,
  *   sessionPath?: string,
+ *   model?: string,
  * }} options
  */
 export async function withQuotaRotation(options) {
 	const locations = accountLocations(options);
+	const family = gatedModelFamily(options.model);
 	let currentCredential = options.credential;
 	const tried = new Set();
 	const remember = (email) => {
 		const key = canonicalAccountEmail(email);
 		if (key) tried.add(key);
 	};
+	const clearSession = () => {
+		if (!options.sessionPath) return;
+		try {
+			saveSession({}, options.sessionPath);
+		} catch {
+			// The next account still starts from whatever session is on disk.
+		}
+	};
+	const takeNext = (currentEmail, reason) => {
+		const rotation = rotateToNextAvailableAccount(currentEmail, { ...locations, model: options.model });
+		const nextKey = canonicalAccountEmail(rotation.newEmail);
+		if (!rotation.rotated || !rotation.credential || !nextKey || tried.has(nextKey)) return false;
+		tried.add(nextKey);
+		options.onRotate?.({ from: currentEmail, to: rotation.newEmail, reason });
+		currentCredential = rotation.credential;
+		clearSession();
+		return true;
+	};
 	remember(currentCredential?.email);
+	if (family) {
+		const index = loadAccountsIndex(locations);
+		if (Object.keys(index.accounts).length > 0) {
+			const currentEmail = canonicalAccountEmail(currentCredential?.email);
+			const current = currentEmail ? index.accounts[currentEmail] : undefined;
+			const allowOnly = indexAllowsModel(index, family);
+			if (!current || !accountMayCall(current, family, allowOnly)) {
+				if (!takeNext(currentEmail, "model-skip")) throw noEligibleAccountError(family);
+			}
+		}
+	}
 	while (true) {
 		try {
 			return await options.run(currentCredential);
 		} catch (error) {
 			const canRotate = options.canRotate ? options.canRotate() : true;
-			if (options.autoRotate === false || !canRotate || !isQuotaError(error)) throw error;
+			const modelDenied = Boolean(family && isModelAccessError(error));
+			const quota = isQuotaError(error);
 			const currentEmail = currentCredential?.email;
-			if (currentEmail) markQuotaExhausted(currentEmail, locations);
-			const rotation = rotateToNextAvailableAccount(currentEmail, locations);
-			const nextKey = canonicalAccountEmail(rotation.newEmail);
-			if (!rotation.rotated || !rotation.credential || !nextKey || tried.has(nextKey)) throw error;
-			tried.add(nextKey);
-			options.onRotate?.({ from: currentEmail, to: rotation.newEmail });
-			currentCredential = rotation.credential;
-			if (options.sessionPath) {
+			if (modelDenied && currentEmail) {
 				try {
-					saveSession({}, options.sessionPath);
+					setAccountModelAccess(currentEmail, family, "deny", locations);
 				} catch {
-					// The next account still starts from whatever session is on disk.
+					// This credential is not in the account index.
 				}
+			}
+			if (quota && currentEmail) markQuotaExhausted(currentEmail, locations);
+			if (options.autoRotate === false || !canRotate || (!quota && !modelDenied)) throw error;
+			if (!takeNext(currentEmail, modelDenied ? "model-access" : "quota")) {
+				if (modelDenied && family && !quota) throw noEligibleAccountError(family);
+				throw error;
 			}
 		}
 	}

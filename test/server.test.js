@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { createApiKey, resolveServerApiKey } from "../src/api-key.js";
-import { normalizeChatRequest, SERVER_MODEL_ID } from "../src/chat.js";
+import { formatChatCompletion, formatOpenAiToolCall, normalizeChatRequest, SERVER_MODEL_ID } from "../src/chat.js";
 import { createChatServer, listen } from "../src/server.js";
 
 /**
@@ -117,6 +117,29 @@ function result(options) {
 		responseId: "resp-1",
 	};
 }
+
+describe("OpenAI thought signatures", () => {
+	it("keeps a signature on the tool call and reads it back from extra_content", () => {
+		const formatted = formatOpenAiToolCall({ id: "call_1", name: "lookup", arguments: { q: "x" }, thoughtSignature: "AQIDBA==" });
+		assert.equal(formatted.extra_content.google.thought_signature, "AQIDBA==");
+		const completion = formatChatCompletion({
+			toolCalls: [{ id: "call_1", name: "lookup", arguments: { q: "x" }, thoughtSignature: "AQIDBA==" }],
+			stopReason: "toolUse",
+		});
+		assert.equal(completion.choices[0].message.tool_calls[0].extra_content.google.thought_signature, "AQIDBA==");
+		const chat = normalizeChatRequest({
+			model: "gemini-4-argon",
+			messages: [
+				{
+					role: "assistant",
+					content: null,
+					tool_calls: [formatted],
+				},
+			],
+		});
+		assert.equal(chat.messages[0].content[0].thoughtSignature, "AQIDBA==");
+	});
+});
 
 describe("chat request", () => {
 	it("forces gemini-3.8-flash and defaults effort to medium", () => {

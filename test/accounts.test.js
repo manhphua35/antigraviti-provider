@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import {
 	accountFileName,
 	accountFilePath,
+	isModelAccessError,
 	isQuotaError,
 	listAccounts,
 	loadAccountsIndex,
@@ -14,8 +15,10 @@ import {
 	resetAccountQuota,
 	rotateToNextAvailableAccount,
 	saveAccountsIndex,
+	setAccountModelAccess,
 	switchActiveAccount,
 	upsertAccount,
+	withQuotaRotation,
 } from "../src/accounts.js";
 import { createChatServer, listen } from "../src/server.js";
 import { loadCredentials, saveCredentials } from "../src/store.js";
@@ -345,6 +348,138 @@ describe("auto-quota rotation", () => {
 			} finally {
 				await new Promise((resolve) => server.close(resolve));
 			}
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("argon account access", () => {
+	it("marks an account allow or deny and keeps the mark across login", () => {
+		const env = setupTestEnv();
+		try {
+			upsertAccount({ email: "a@gmail.com", projectId: "p-a", access: "t-a", refresh: "r-a" }, env);
+			upsertAccount({ email: "b@gmail.com", projectId: "p-b", access: "t-b", refresh: "r-b" }, env);
+			const denied = setAccountModelAccess("A@gmail.com", "argon", "no", env);
+			assert.equal(denied.access, "deny");
+			assert.equal(denied.model, "gemini-4-argon");
+			upsertAccount({ email: "a@gmail.com", projectId: "p-a2", access: "t-a2", refresh: "r-a2" }, env);
+			const listed = listAccounts(env);
+			assert.equal(listed.find((account) => account.email === "a@gmail.com").argon, "deny");
+			assert.equal(listed.find((account) => account.email === "b@gmail.com").argon, "unknown");
+			assert.equal(setAccountModelAccess("a@gmail.com", "gemini-4-argon", "clear", env).access, "unknown");
+			assert.equal(listAccounts(env).find((account) => account.email === "a@gmail.com").modelAccess, undefined);
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+
+	it("sends argon only to accounts marked allow", async () => {
+		const env = setupTestEnv();
+		try {
+			upsertAccount({ email: "a@gmail.com", projectId: "p-a", access: "t-a", refresh: "r-a" }, env);
+			upsertAccount({ email: "b@gmail.com", projectId: "p-b", access: "t-b", refresh: "r-b" }, env);
+			upsertAccount({ email: "c@gmail.com", projectId: "p-c", access: "t-c", refresh: "r-c" }, env);
+			setAccountModelAccess("b@gmail.com", "argon", "allow", env);
+			setAccountModelAccess("c@gmail.com", "argon", "deny", env);
+			switchActiveAccount("a@gmail.com", env);
+			const calls = [];
+			const rotations = [];
+			const result = await withQuotaRotation({
+				credential: loadCredentials(env.credentialPath),
+				...env,
+				model: "gemini-4-argon-medium",
+				onRotate(info) {
+					rotations.push(info);
+				},
+				run(credential) {
+					calls.push(credential.email);
+					return Promise.resolve(credential.email);
+				},
+			});
+			assert.equal(result, "b@gmail.com");
+			assert.deepEqual(calls, ["b@gmail.com"]);
+			assert.equal(rotations[0].reason, "model-skip");
+			assert.equal(rotations[0].to, "b@gmail.com");
+			const skipped = rotateToNextAvailableAccount("b@gmail.com", { ...env, model: "gemini-4-argon" });
+			assert.equal(skipped.rotated, false);
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+
+	it("marks a 404 account deny and tries the next unmarked account", async () => {
+		const env = setupTestEnv();
+		try {
+			upsertAccount({ email: "a@gmail.com", projectId: "p-a", access: "t-a", refresh: "r-a" }, env);
+			upsertAccount({ email: "b@gmail.com", projectId: "p-b", access: "t-b", refresh: "r-b" }, env);
+			switchActiveAccount("a@gmail.com", env);
+			const calls = [];
+			const result = await withQuotaRotation({
+				credential: loadCredentials(env.credentialPath),
+				...env,
+				model: "gemini-4-argon",
+				run(credential) {
+					calls.push(credential.email);
+					if (credential.email === "a@gmail.com") {
+						throw new AntigravityApiError("Requested entity was not found.", { status: 404 });
+					}
+					return Promise.resolve("ok");
+				},
+			});
+			assert.equal(result, "ok");
+			assert.deepEqual(calls, ["a@gmail.com", "b@gmail.com"]);
+			const listed = listAccounts(env);
+			assert.equal(listed.find((account) => account.email === "a@gmail.com").argon, "deny");
+			assert.equal(listed.find((account) => account.email === "b@gmail.com").argon, "unknown");
+			assert.equal(isModelAccessError(new AntigravityApiError("nope", { status: 404 })), true);
+			assert.equal(isModelAccessError(new AntigravityApiError("rate limit", { status: 429 })), false);
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not call argon when every account is deny", async () => {
+		const env = setupTestEnv();
+		try {
+			upsertAccount({ email: "a@gmail.com", projectId: "p-a", access: "t-a", refresh: "r-a" }, env);
+			setAccountModelAccess("a@gmail.com", "argon", "deny", env);
+			await assert.rejects(
+				() =>
+					withQuotaRotation({
+						credential: loadCredentials(env.credentialPath),
+						...env,
+						model: "gemini-4-argon",
+						run() {
+							throw new Error("should not call");
+						},
+					}),
+				/No account can call gemini-4-argon/,
+			);
+		} finally {
+			fs.rmSync(env.dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps flash calls on the active account when that account cannot call argon", async () => {
+		const env = setupTestEnv();
+		try {
+			upsertAccount({ email: "a@gmail.com", projectId: "p-a", access: "t-a", refresh: "r-a" }, env);
+			upsertAccount({ email: "b@gmail.com", projectId: "p-b", access: "t-b", refresh: "r-b" }, env);
+			setAccountModelAccess("a@gmail.com", "argon", "deny", env);
+			setAccountModelAccess("b@gmail.com", "argon", "allow", env);
+			switchActiveAccount("a@gmail.com", env);
+			const calls = [];
+			await withQuotaRotation({
+				credential: loadCredentials(env.credentialPath),
+				...env,
+				model: "gemini-3.8-flash",
+				run(credential) {
+					calls.push(credential.email);
+					return Promise.resolve("ok");
+				},
+			});
+			assert.deepEqual(calls, ["a@gmail.com"]);
 		} finally {
 			fs.rmSync(env.dir, { recursive: true, force: true });
 		}

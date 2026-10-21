@@ -14,8 +14,13 @@ export const ANTIGRAVITY_DAILY_ENDPOINT = CLOUD_CODE_ASSIST_ENDPOINT;
 export const ANTIGRAVITY_SANDBOX_ENDPOINT = CLOUD_CODE_ASSIST_SANDBOX_ENDPOINT;
 export const FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels";
 export const DEFAULT_MODEL_ID = "gemini-3.1-pro";
+export const GEMINI_4_ARGON_ID = "gemini-4-argon";
 export const DEFAULT_CONTEXT_WINDOW = 200_000;
 export const DEFAULT_MAX_TOKENS = 64_000;
+const PUBLISHED_MODEL_LIMITS = Object.freeze({
+	"gemini-4-argon": { maxTokens: 1_048_576, maxOutputTokens: 65_536 },
+	"gemini-3.8-flash": { maxTokens: 1_048_576, maxOutputTokens: 65_536 },
+});
 
 const DISCOVERY_DENYLIST = new Set(["chat_20706", "chat_23310", "gemini-2.5-pro"]);
 
@@ -75,6 +80,20 @@ const FLASH_TEMPLATE = /^gemini-(\d+(?:\.\d+){0,2})-flash-(low|medium|high|tiere
  */
 const STATIC_FAMILIES = [
 	{
+		id: GEMINI_4_ARGON_ID,
+		name: "Gemini 4 Argon",
+		members: ["gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"],
+		routing: {
+			low: "gemini-4-argon-low",
+			medium: "gemini-4-argon-medium",
+			high: "gemini-4-argon-high",
+		},
+		mode: "google-level",
+		efforts: ["low", "medium", "high"],
+		requiresEffort: true,
+		aliases: [GEMINI_4_ARGON_ID],
+	},
+	{
 		id: "gemini-3.5-flash",
 		name: "Gemini 3.5 Flash",
 		members: ["gemini-3.5-flash-extra-low", "gemini-3.5-flash-low", "gemini-3-flash-agent"],
@@ -117,20 +136,6 @@ const STATIC_FAMILIES = [
 		},
 		mode: "google-level",
 		efforts: ["low", "high"],
-		suppressWhenOff: true,
-	},
-	{
-		id: "gemini-4-argon",
-		name: "Gemini 4 Argon",
-		members: ["gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"],
-		routing: {
-			off: "gemini-4-argon-low",
-			low: "gemini-4-argon-low",
-			medium: "gemini-4-argon-medium",
-			high: "gemini-4-argon-high",
-		},
-		mode: "google-level",
-		efforts: ["low", "medium", "high"],
 		suppressWhenOff: true,
 	},
 	{
@@ -571,11 +576,13 @@ export function catalogAntigravityModel(id, endpoint = ANTIGRAVITY_DAILY_ENDPOIN
 		memberIds = family.members;
 		name = family.name;
 	}
+	const published = PUBLISHED_MODEL_LIMITS[wanted];
 	const specs = memberIds.map((memberId) =>
 		specFromDiscovery(endpoint, memberId, {
 			displayName: name,
 			supportsThinking: true,
 			supportsImages: memberId.startsWith("gemini-") || memberId.startsWith("gemma-"),
+			...published,
 		}),
 	);
 	return collapseAntigravityModels(specs).find((model) => model.id === wanted || model.aliases?.includes(wanted));

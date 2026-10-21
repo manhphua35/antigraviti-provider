@@ -20,7 +20,7 @@ import {
 	nextToolCallId,
 	retainThoughtSignature,
 } from "./request.js";
-import { loadSession, saveSession } from "./session.js";
+import { loadSession, rememberToolSignatures, saveSession } from "./session.js";
 import { ensureAntigravityVersion, getAntigravityUserAgent } from "./user-agent.js";
 
 const STREAM_PATH = "/v1internal:streamGenerateContent?alt=sse";
@@ -218,6 +218,36 @@ async function* withFirstEventTimeout(source, ms, signal) {
  * @param {number} firstEventTimeoutMs
  * @param {{ onText?: (delta: string) => void, onThinking?: (delta: string) => void }} hooks
  */
+function mergeFields(base, extra) {
+	const merged = base && typeof base === "object" && !Array.isArray(base) ? { ...base } : {};
+	for (const [key, value] of Object.entries(extra)) {
+		if (
+			value &&
+			typeof value === "object" &&
+			!Array.isArray(value) &&
+			merged[key] &&
+			typeof merged[key] === "object" &&
+			!Array.isArray(merged[key])
+		) {
+			merged[key] = mergeFields(merged[key], value);
+			continue;
+		}
+		merged[key] = value;
+	}
+	return merged;
+}
+
+function readCount(metadata, keys) {
+	if (!metadata) return undefined;
+	for (const key of keys) {
+		if (!Object.prototype.hasOwnProperty.call(metadata, key)) continue;
+		if (metadata[key] == null || metadata[key] === "") continue;
+		const number = Number(metadata[key]);
+		if (Number.isFinite(number)) return number;
+	}
+	return undefined;
+}
+
 async function consumeStream(response, model, toolNames, signal, firstEventTimeoutMs, hooks) {
 	if (!response.body) throw apiError("Cloud Code Assist returned an empty body", response.status, "empty-body");
 	/** @type {Array<object>} */
@@ -268,7 +298,7 @@ async function consumeStream(response, model, toolNames, signal, firstEventTimeo
 			const code = typeof chunk.error.code === "number" ? chunk.error.code : undefined;
 			throw apiError(`Cloud Code Assist stream error: ${detail}`, code, "runtime");
 		}
-		const data = chunk?.response;
+		const data = chunk?.response ?? (chunk?.candidates || chunk?.usageMetadata || chunk?.usage_metadata ? chunk : undefined);
 		if (!data) continue;
 		if (data.responseId) responseId = data.responseId;
 		if (!data.candidates?.length && data.promptFeedback?.blockReason) {
@@ -329,6 +359,7 @@ async function consumeStream(response, model, toolNames, signal, firstEventTimeo
 						...(part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
 					};
 					content.push(toolCall);
+					hooks.onToolCall?.(toolCall);
 				}
 			}
 		}
@@ -342,17 +373,30 @@ async function consumeStream(response, model, toolNames, signal, firstEventTimeo
 				if (mapped === "error") errorMessage = `Generation failed with finish reason: ${candidate.finishReason}`;
 			}
 		}
-		if (data.usageMetadata) {
-			const promptTokens = data.usageMetadata.promptTokenCount || 0;
-			const cacheRead = data.usageMetadata.cachedContentTokenCount || 0;
-			const reasoningTokens = data.usageMetadata.thoughtsTokenCount || 0;
+		const metadata = data.usageMetadata ?? data.usage_metadata ?? chunk?.usageMetadata ?? chunk?.usage_metadata;
+		if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) {
+			const raw = mergeFields(usage.raw, metadata);
+			const promptTokens = readCount(raw, ["promptTokenCount", "prompt_token_count"]);
+			const reportedCache = readCount(raw, [
+				"cachedContentTokenCount",
+				"cached_content_token_count",
+				"cachedTokenCount",
+				"cached_token_count",
+			]);
+			const candidates = readCount(raw, ["candidatesTokenCount", "candidates_token_count"]);
+			const reasoningTokens = readCount(raw, ["thoughtsTokenCount", "thoughts_token_count"]);
+			const totalTokens = readCount(raw, ["totalTokenCount", "total_token_count"]);
+			const prompt = promptTokens ?? 0;
+			const cacheRead = reportedCache ?? 0;
+			const thoughts = reasoningTokens ?? 0;
+			const visible = candidates ?? 0;
 			usage = {
-				input: promptTokens - cacheRead,
-				output: (data.usageMetadata.candidatesTokenCount || 0) + reasoningTokens,
+				input: Math.max(0, prompt - cacheRead),
+				output: visible + thoughts,
 				cacheRead,
-				cacheWrite: 0,
-				totalTokens: data.usageMetadata.totalTokenCount || 0,
-				reasoningTokens,
+				totalTokens: totalTokens ?? prompt + visible + thoughts,
+				reasoningTokens: thoughts,
+				raw,
 			};
 		}
 	}
@@ -640,6 +684,7 @@ export async function generateAntigravity(options) {
 			}
 			if (mode === "auto") state.lastGoodEndpoint = endpoint;
 			state.lastExecutionId = streamed.responseId;
+			rememberToolSignatures(state, streamed.content, built.resolved.wireModelId);
 			if (options.sessionPath && options.save !== false) saveSession(state, options.sessionPath);
 			const text = streamed.content
 				.filter((block) => block.type === "text")

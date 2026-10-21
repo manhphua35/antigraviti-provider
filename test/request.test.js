@@ -156,7 +156,7 @@ describe("Antigravity request envelope", () => {
 		assert.equal(body.request.generationConfig.thinkingConfig.thinkingBudget > 0, true);
 	});
 
-	it("replays a valid signature and puts the skip sentinel only on the first unsigned Gemini 3 call", () => {
+	it("replays a stored signature and puts the skip sentinel on every unsigned Gemini 3 call", () => {
 		const pro = model("gemini-3.1-pro");
 		const signed = convertMessages(pro, [
 			{
@@ -171,7 +171,7 @@ describe("Antigravity request envelope", () => {
 		]);
 		assert.equal(signed[0].parts[0].thoughtSignature, "AQIDBA==");
 		assert.equal(signed[0].parts[0].functionCall.id, "call_1");
-		assert.equal(signed[0].parts[1].thoughtSignature, undefined);
+		assert.equal(signed[0].parts[1].thoughtSignature, "skip_thought_signature_validator");
 
 		const unsigned = convertMessages(pro, [
 			{
@@ -185,7 +185,29 @@ describe("Antigravity request envelope", () => {
 			},
 		]);
 		assert.equal(unsigned[0].parts[0].thoughtSignature, "skip_thought_signature_validator");
-		assert.equal(unsigned[0].parts[1].thoughtSignature, undefined);
+		assert.equal(unsigned[0].parts[1].thoughtSignature, "skip_thought_signature_validator");
+
+		const restored = convertMessages(
+			pro,
+			[
+				{
+					role: "assistant",
+					content: [
+						{ type: "toolCall", id: "call_1", name: "one", arguments: {} },
+						{ type: "toolCall", id: "call_2", name: "two", arguments: {} },
+					],
+				},
+			],
+			{
+				wireModelId: "gemini-pro-agent",
+				toolSignatures: {
+					call_1: { signature: "AQIDBA==", wireModelId: "gemini-pro-agent" },
+					call_2: { signature: "BAUGBw==", wireModelId: "gemini-3.1-pro-low" },
+				},
+			},
+		);
+		assert.equal(restored[0].parts[0].thoughtSignature, "AQIDBA==");
+		assert.equal(restored[0].parts[1].thoughtSignature, "skip_thought_signature_validator");
 
 		const older = convertMessages(model("gemini-2.5-flash"), [
 			{

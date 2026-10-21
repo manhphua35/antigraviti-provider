@@ -47,6 +47,7 @@ export function loadSession(file) {
 			stepIndex: typeof parsed.stepIndex === "number" ? parsed.stepIndex : undefined,
 			lastExecutionId: typeof parsed.lastExecutionId === "string" ? parsed.lastExecutionId : undefined,
 			lastGoodEndpoint: typeof parsed.lastGoodEndpoint === "string" ? parsed.lastGoodEndpoint : undefined,
+			toolSignatures: readToolSignatures(parsed.toolSignatures),
 		};
 	} catch (error) {
 		if (/** @type {NodeJS.ErrnoException} */ (error).code === "ENOENT") return {};
@@ -66,5 +67,47 @@ export function saveSession(state, file) {
 		stepIndex: state.stepIndex,
 		lastExecutionId: state.lastExecutionId,
 		lastGoodEndpoint: state.lastGoodEndpoint,
+		toolSignatures: state.toolSignatures,
 	});
+}
+
+const MAX_TOOL_SIGNATURES = 500;
+const MAX_TOOL_SIGNATURE_LENGTH = 16384;
+
+function readToolSignatures(value) {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	/** @type {Record<string, { signature: string, wireModelId: string }>} */
+	const out = {};
+	for (const [id, entry] of Object.entries(value)) {
+		if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) continue;
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const signature = /** @type {{ signature?: unknown, wireModelId?: unknown }} */ (entry).signature;
+		const wireModelId = /** @type {{ signature?: unknown, wireModelId?: unknown }} */ (entry).wireModelId;
+		if (typeof signature !== "string" || signature.length === 0 || signature.length > MAX_TOOL_SIGNATURE_LENGTH) continue;
+		if (typeof wireModelId !== "string" || wireModelId.length === 0 || wireModelId.length > 128) continue;
+		out[id] = { signature, wireModelId };
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
+export function rememberToolSignature(state, id, signature, wireModelId) {
+	if (!state || typeof id !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(id)) return;
+	if (typeof signature !== "string" || signature.length === 0 || signature.length > MAX_TOOL_SIGNATURE_LENGTH) return;
+	if (typeof wireModelId !== "string" || wireModelId.length === 0 || wireModelId.length > 128) return;
+	if (!state.toolSignatures || typeof state.toolSignatures !== "object" || Array.isArray(state.toolSignatures)) {
+		state.toolSignatures = {};
+	}
+	if (Object.prototype.hasOwnProperty.call(state.toolSignatures, id)) delete state.toolSignatures[id];
+	state.toolSignatures[id] = { signature, wireModelId };
+	const ids = Object.keys(state.toolSignatures);
+	if (ids.length <= MAX_TOOL_SIGNATURES) return;
+	for (const oldId of ids.slice(0, ids.length - MAX_TOOL_SIGNATURES)) delete state.toolSignatures[oldId];
+}
+
+export function rememberToolSignatures(state, content, wireModelId) {
+	if (!Array.isArray(content)) return;
+	for (const block of content) {
+		if (block?.type !== "toolCall" || typeof block.id !== "string" || typeof block.thoughtSignature !== "string") continue;
+		rememberToolSignature(state, block.id, block.thoughtSignature, wireModelId);
+	}
 }
