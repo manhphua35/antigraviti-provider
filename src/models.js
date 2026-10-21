@@ -120,6 +120,20 @@ const STATIC_FAMILIES = [
 		suppressWhenOff: true,
 	},
 	{
+		id: "gemini-4-argon",
+		name: "Gemini 4 Argon",
+		members: ["gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"],
+		routing: {
+			off: "gemini-4-argon-low",
+			low: "gemini-4-argon-low",
+			medium: "gemini-4-argon-medium",
+			high: "gemini-4-argon-high",
+		},
+		mode: "google-level",
+		efforts: ["low", "medium", "high"],
+		suppressWhenOff: true,
+	},
+	{
 		id: "gpt-oss-120b",
 		name: "GPT-OSS 120B",
 		members: ["gpt-oss-120b-medium"],

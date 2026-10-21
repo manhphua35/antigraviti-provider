@@ -6,6 +6,7 @@
 import crypto from "node:crypto";
 
 export const SERVER_MODEL_ID = "gemini-3.8-flash";
+export const SERVER_MODEL_IDS = Object.freeze(["gemini-3.8-flash", "gemini-4-argon"]);
 export const DEFAULT_SERVER_EFFORT = "medium";
 
 const EFFORTS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -218,8 +219,9 @@ export function normalizeChatRequest(body) {
 	if (messages.length === 0 && !prompt) throw new ChatRequestError("Pass messages or a prompt");
 	const maxTokens = optionalNumber(body.maxTokens ?? body.max_tokens, "max_tokens");
 	if (maxTokens !== undefined && maxTokens <= 0) throw new ChatRequestError("Invalid max_tokens");
+	const model = typeof body?.model === "string" && SERVER_MODEL_IDS.includes(body.model) ? body.model : SERVER_MODEL_ID;
 	return {
-		model: SERVER_MODEL_ID,
+		model,
 		effort,
 		systemPrompt: systemParts.length > 0 ? systemParts.join("\n\n") : undefined,
 		messages,
@@ -251,6 +253,60 @@ export function normalizeChatRequest(body) {
  *   responseId?: string,
  * }} result
  */
+/**
+ * @param {{
+ *   input?: number,
+ *   output?: number,
+ *   totalTokens?: number,
+ *   cacheRead?: number,
+ *   reasoningTokens?: number,
+ *   raw?: Record<string, any>,
+ * } | undefined} usage
+ */
+export function formatUsage(usage) {
+	const cachedTokens = usage?.cacheRead ?? usage?.raw?.cachedContentTokenCount ?? 0;
+	const promptTokens = usage?.raw?.promptTokenCount ?? ((usage?.input ?? 0) + cachedTokens);
+	const promptCacheMissTokens = usage?.input ?? Math.max(0, promptTokens - cachedTokens);
+	const completionTokens = usage?.output ?? 0;
+	const totalTokens = usage?.totalTokens ?? (promptTokens + completionTokens);
+	const reasoningTokens = usage?.reasoningTokens ?? 0;
+
+	/** @type {Record<string, any>} */
+	const formatted = {
+		prompt_tokens: promptTokens,
+		completion_tokens: completionTokens,
+		total_tokens: totalTokens,
+	};
+	if (cachedTokens > 0 || usage?.cacheRead !== undefined || usage?.raw?.cachedContentTokenCount !== undefined) {
+		formatted.prompt_tokens_details = { cached_tokens: cachedTokens };
+		formatted.prompt_cache_hit_tokens = cachedTokens;
+		formatted.prompt_cache_miss_tokens = promptCacheMissTokens;
+	}
+	if (reasoningTokens > 0 || usage?.reasoningTokens !== undefined) {
+		formatted.completion_tokens_details = { reasoning_tokens: reasoningTokens };
+	}
+	if (usage?.raw?.trafficType !== undefined) {
+		formatted.trafficType = usage.raw.trafficType;
+	}
+	if (usage?.raw !== undefined) {
+		formatted.usageMetadata = usage.raw;
+	}
+	return formatted;
+}
+
+/**
+ * @param {{
+ *   text?: string,
+ *   thinking?: string,
+ *   toolCalls?: object[],
+ *   stopReason?: string,
+ *   usage?: { input?: number, output?: number, totalTokens?: number },
+ *   effort?: string,
+ *   wireModelId?: string,
+ *   responseId?: string,
+ *   model?: string,
+ * }} result
+ */
 export function formatChatCompletion(result) {
 	const toolCalls = (result.toolCalls ?? []).map((call) => ({
 		id: call.id,
@@ -264,7 +320,7 @@ export function formatChatCompletion(result) {
 	return {
 		id: result.responseId ? `chatcmpl-${result.responseId}` : `chatcmpl-${crypto.randomUUID()}`,
 		object: "chat.completion",
-		model: SERVER_MODEL_ID,
+		model: result.model ?? SERVER_MODEL_ID,
 		effort: result.effort ?? DEFAULT_SERVER_EFFORT,
 		wireModelId: result.wireModelId,
 		choices: [
@@ -278,11 +334,7 @@ export function formatChatCompletion(result) {
 				finish_reason: finishReason,
 			},
 		],
-		usage: {
-			prompt_tokens: result.usage?.input ?? 0,
-			completion_tokens: result.usage?.output ?? 0,
-			total_tokens: result.usage?.totalTokens ?? 0,
-		},
+		usage: formatUsage(result.usage),
 		text: result.text ?? "",
 		thinking: result.thinking ?? "",
 		toolCalls: result.toolCalls ?? [],
@@ -294,12 +346,13 @@ export function formatChatCompletion(result) {
  * @param {string} id
  * @param {Record<string, unknown>} delta
  * @param {string | null} finishReason
+ * @param {string} [model]
  */
-export function formatChatChunk(id, delta, finishReason) {
+export function formatChatChunk(id, delta, finishReason, model = SERVER_MODEL_ID) {
 	return {
 		id,
 		object: "chat.completion.chunk",
-		model: SERVER_MODEL_ID,
+		model,
 		choices: [{ index: 0, delta, finish_reason: finishReason }],
 	};
 }
@@ -318,11 +371,10 @@ export function formatModelObject(id = SERVER_MODEL_ID) {
 
 /**
  * Format the models list response in OpenAI format.
- * Only gemini-3.8-flash is supported.
  */
 export function formatModelsList() {
 	return {
 		object: "list",
-		data: [formatModelObject(SERVER_MODEL_ID)],
+		data: SERVER_MODEL_IDS.map((id) => formatModelObject(id)),
 	};
 }

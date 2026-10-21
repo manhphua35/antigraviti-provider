@@ -55,9 +55,11 @@ export {
 } from "./api-key.js";
 export {
 	SERVER_MODEL_ID,
+	SERVER_MODEL_IDS,
 	DEFAULT_SERVER_EFFORT,
 	normalizeChatRequest,
 	formatChatCompletion,
+	formatUsage,
 	formatModelsList,
 	formatModelObject,
 	readRequestApiKey,
