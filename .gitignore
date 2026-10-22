@@ -2,3 +2,8 @@ node_modules/
 credentials.json
 *.log
 *.tmp
+
+launcher/target/
+launcher/dist/
+launcher/payload/
+dist/
